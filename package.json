@@ -1,0 +1,11 @@
+{
+  "name": "flowch-importer",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "license": "MIT",
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "iconv-lite": "^0.7.0"
+  }
+}
