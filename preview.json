@@ -1,0 +1,169 @@
+{
+  "filename": "sample.csv",
+  "contentType": "text/csv",
+  "linhasLidas": 2000,
+  "preview": [
+    {
+      "id": "1",
+      "descricao": "PRODUTO 0001",
+      "xProd": "PRODUTO 0001",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "35",
+      "valor_unitario": "8.96"
+    },
+    {
+      "id": "2",
+      "descricao": "PRODUTO 0002",
+      "xProd": "PRODUTO 0002",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "76",
+      "valor_unitario": "493.91"
+    },
+    {
+      "id": "3",
+      "descricao": "PRODUTO 0003",
+      "xProd": "PRODUTO 0003",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "67",
+      "valor_unitario": "146.78"
+    },
+    {
+      "id": "4",
+      "descricao": "PRODUTO 0004",
+      "xProd": "PRODUTO 0004",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "95",
+      "valor_unitario": "111.20"
+    },
+    {
+      "id": "5",
+      "descricao": "PRODUTO 0005",
+      "xProd": "PRODUTO 0005",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "8",
+      "valor_unitario": "265.26"
+    },
+    {
+      "id": "6",
+      "descricao": "PRODUTO 0006",
+      "xProd": "PRODUTO 0006",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "24",
+      "valor_unitario": "49.06"
+    },
+    {
+      "id": "7",
+      "descricao": "PRODUTO 0007",
+      "xProd": "PRODUTO 0007",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "40",
+      "valor_unitario": "165.17"
+    },
+    {
+      "id": "8",
+      "descricao": "PRODUTO 0008",
+      "xProd": "PRODUTO 0008",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "27",
+      "valor_unitario": "158.47"
+    },
+    {
+      "id": "9",
+      "descricao": "PRODUTO 0009",
+      "xProd": "PRODUTO 0009",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "75",
+      "valor_unitario": "447.62"
+    },
+    {
+      "id": "10",
+      "descricao": "PRODUTO 0010",
+      "xProd": "PRODUTO 0010",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "19",
+      "valor_unitario": "350.72"
+    }
+  ],
+  "primeirasLinhas": [
+    {
+      "id": "1",
+      "descricao": "PRODUTO 0001",
+      "xProd": "PRODUTO 0001",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "35",
+      "valor_unitario": "8.96"
+    },
+    {
+      "id": "2",
+      "descricao": "PRODUTO 0002",
+      "xProd": "PRODUTO 0002",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "76",
+      "valor_unitario": "493.91"
+    },
+    {
+      "id": "3",
+      "descricao": "PRODUTO 0003",
+      "xProd": "PRODUTO 0003",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "67",
+      "valor_unitario": "146.78"
+    },
+    {
+      "id": "4",
+      "descricao": "PRODUTO 0004",
+      "xProd": "PRODUTO 0004",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "95",
+      "valor_unitario": "111.20"
+    },
+    {
+      "id": "5",
+      "descricao": "PRODUTO 0005",
+      "xProd": "PRODUTO 0005",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "8",
+      "valor_unitario": "265.26"
+    },
+    {
+      "id": "6",
+      "descricao": "PRODUTO 0006",
+      "xProd": "PRODUTO 0006",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "24",
+      "valor_unitario": "49.06"
+    },
+    {
+      "id": "7",
+      "descricao": "PRODUTO 0007",
+      "xProd": "PRODUTO 0007",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "40",
+      "valor_unitario": "165.17"
+    },
+    {
+      "id": "8",
+      "descricao": "PRODUTO 0008",
+      "xProd": "PRODUTO 0008",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "27",
+      "valor_unitario": "158.47"
+    },
+    {
+      "id": "9",
+      "descricao": "PRODUTO 0009",
+      "xProd": "PRODUTO 0009",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "75",
+      "valor_unitario": "447.62"
+    },
+    {
+      "id": "10",
+      "descricao": "PRODUTO 0010",
+      "xProd": "PRODUTO 0010",
+      "C99_FINANCEIRO_NOTA_FISCAL_Id": "",
+      "quantidade": "19",
+      "valor_unitario": "350.72"
+    }
+  ]
+}
