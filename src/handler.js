@@ -49,6 +49,11 @@ function percentile(nums, p) {
   return arr[idx];
 }
 
+function toFiniteNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+}
+
 function toNumberLocale(input, kind = 'float') {
   if (input == null || input === '') return input;
   if (typeof input === 'number') return input;
@@ -408,7 +413,9 @@ async function handler(event, context) {
             size: 0,
             recordsInserted: 0,
             recordsUpdated: 0,
-            recordsDeleted: 0
+            recordsDeleted: 0,
+            recordsErrors: 0,
+            flowchErrors: []
           }
         });
       }
@@ -420,7 +427,13 @@ async function handler(event, context) {
 
       let i = Math.min(startOffset, payloadRecordsAll.length);
       const resultsAgg = [];
-      let totals = { size: 0, recordsInserted: 0, recordsUpdated: 0, recordsDeleted: 0, errors: [] };
+      let totals = {
+        size: 0,
+        recordsInserted: 0,
+        recordsUpdated: 0,
+        recordsDeleted: 0,
+        errors: []
+      };
 
       while (i < payloadRecordsAll.length) {
         const end = Math.min(i + (Number.isFinite(directBatchSize) && directBatchSize > 0 ? directBatchSize : 20), payloadRecordsAll.length);
@@ -439,11 +452,13 @@ async function handler(event, context) {
         resultsAgg.push(...agg.results);
         for (const r of agg.results) {
           const b = r.body || {};
-          totals.size += (r.size || 0);
-          totals.recordsInserted += (b.recordsInserted || 0);
-          totals.recordsUpdated  += (b.recordsUpdated  || 0);
-          totals.recordsDeleted  += (b.recordsDeleted  || 0);
-          if (Array.isArray(b.errors)) totals.errors.push(...b.errors);
+          totals.size += toFiniteNumber(r.size);
+          totals.recordsInserted += toFiniteNumber(b.recordsInserted);
+          totals.recordsUpdated  += toFiniteNumber(b.recordsUpdated);
+          totals.recordsDeleted  += toFiniteNumber(b.recordsDeleted);
+          if (Array.isArray(b.errors) && b.errors.length) {
+            totals.errors.push(...b.errors);
+          }
         }
 
         i = end;
@@ -476,7 +491,9 @@ async function handler(event, context) {
                 size: totals.size,
                 recordsInserted: totals.recordsInserted,
                 recordsUpdated: totals.recordsUpdated,
-                recordsDeleted: totals.recordsDeleted
+                recordsDeleted: totals.recordsDeleted,
+                recordsErrors: totals.errors.length,
+                flowchErrors: totals.errors
               }
             })
           };
@@ -519,6 +536,8 @@ async function handler(event, context) {
           recordsInserted: totals.recordsInserted,
           recordsUpdated: totals.recordsUpdated,
           recordsDeleted: totals.recordsDeleted,
+          recordsErrors: totals.errors.length,
+          flowchErrors: totals.errors,
           errorSamples
         }
       });
