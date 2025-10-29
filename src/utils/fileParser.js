@@ -4,6 +4,7 @@
 
 const ExcelJS = require('exceljs');
 const { parseCsvToObjects } = require('./csv');
+const { parseXmlToObjects } = require('./xml');
 const iconv = require('iconv-lite');
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
@@ -17,6 +18,7 @@ function detectKind({ contentType = '', filename = '' }) {
   if (ct.includes('text/csv') || ct.includes('application/csv') || name.endsWith('.csv')) return 'csv';
   if (ct.includes('spreadsheetml') || name.endsWith('.xlsx')) return 'xlsx';
   if (ct.includes('ms-excel') || name.endsWith('.xls')) return 'xls';
+  if (ct.includes('application/xml') || ct.includes('text/xml') || name.endsWith('.xml')) return 'xml';
   return 'unknown';
 }
 
@@ -208,7 +210,7 @@ function decodeSmartCsv(buffer) {
  * - XLS → rejeita
  * - Unknown → tenta XLSX; se falhar, tenta CSV
  */
-async function parseFileToObjects({ buffer, contentType, filename }) {
+async function parseFileToObjects({ buffer, contentType, filename, headers }) {
   if (!buffer || !buffer.length) return [];
   assertSize(buffer);
 
@@ -227,6 +229,11 @@ async function parseFileToObjects({ buffer, contentType, filename }) {
   if (kind === 'xls') {
     const e = new Error('Arquivos .xls não são suportados por segurança. Exporte como .xlsx ou .csv.');
     e.statusCode = 400; throw e;
+  }
+
+  if (kind === 'xml') {
+    const text = buffer.toString('utf8');
+    return parseXmlToObjects(text, {headers, maxRows: MAX_ROWS, maxCols: MAX_COLS});
   }
 
   // Fallback: tenta como XLSX; se falhar, tenta CSV (com decode inteligente)

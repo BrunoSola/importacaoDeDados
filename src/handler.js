@@ -207,15 +207,15 @@ function isLikelyText(buf) {
   const hasNewline = head.includes(0x0A) || head.includes(0x0D);
   return !hasNulls && hasNewline;
 }
+
 function sniffContentType(buf) {
-  // XLSX: ZIP "PK"
-  if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4B) {
-    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-  }
-  // CSV (texto)
+  if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4B) return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const head = buf.slice(0, 64).toString('utf8').trim();
+  if (head.startsWith('<')) return 'application/xml';
   if (isLikelyText(buf)) return 'text/csv';
   return 'application/octet-stream';
 }
+
 function defaultFilenameByType(ct) {
   if ((ct || '').includes('spreadsheetml')) return 'upload.xlsx';
   if ((ct || '').startsWith('text/')) return 'upload.csv';
@@ -361,7 +361,7 @@ async function handler(event, context) {
     // 4) Parse do arquivo → array de objetos (1ª linha = cabeçalho)
     let rows;
     try {
-      rows = await parseFileToObjects({ buffer, contentType, filename });
+      rows = await parseFileToObjects({ buffer, contentType, filename, headers: headersLower });
       console.log('file-kind', { decidedKind: detectKind({ contentType, filename }) });
     } catch (e) {
       const status = e.statusCode || 400;
