@@ -1,0 +1,7 @@
+const LIMITES_IMPORTACAO = {
+  MAX_BYTES: 5 * 1024 * 1024, // 5MB
+  MAX_ROWS: 10000,
+  MAX_COLS: 200,
+};
+
+module.exports = LIMITES_IMPORTACAO;
