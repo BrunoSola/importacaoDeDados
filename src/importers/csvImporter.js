@@ -1,3 +1,5 @@
+// src/importers/csvImporter.js
+
 const iconv = require('iconv-lite');
 const LIMITES = require('./limites');
 const { parseCsvToObjects } = require('../utils/csv');
@@ -16,9 +18,10 @@ function decodificarCsv(buffer) {
   return texto;
 }
 
-async function carregarTabelaCsv({ buffer, limites = LIMITES }) {
+async function carregarTabelaCsv({ buffer, limites = LIMITES, limitarLinhas = 0 }) {
+  const maxRows = Number(limitarLinhas) > 0 ? Number(limitarLinhas) : limites.MAX_ROWS;
   const texto = decodificarCsv(buffer);
-  return parseCsvToObjects(texto, { maxRows: limites.MAX_ROWS, maxCols: limites.MAX_COLS });
+  return parseCsvToObjects(texto, { maxRows, maxCols: limites.MAX_COLS });
 }
 
 module.exports = {

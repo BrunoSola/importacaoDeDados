@@ -32,12 +32,12 @@ function garantirTamanhoSeguro(buffer, maxBytes = LIMITES.MAX_BYTES) {
   }
 }
 
-async function parseFileToObjects({ buffer, contentType, filename, headers }) {
+async function parseFileToObjects({ buffer, contentType, filename, headers, limitarLinhas }) {
   if (!buffer || !buffer.length) return [];
   garantirTamanhoSeguro(buffer);
 
   const tipoDetectado = detectKind({ contentType, filename });
-  const contexto = { buffer, headers, limites: LIMITES };
+  const contexto = { buffer, headers, limites: LIMITES, limitarLinhas };
 
   if (tipoDetectado === 'xls') {
     const e = new Error('Arquivos .xls não são suportados por segurança. Exporte como .xlsx ou .csv.');

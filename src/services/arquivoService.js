@@ -1,6 +1,8 @@
-const { readBodyBase64 } = require('../utils/parseEvent');
+// src/services/arquivoService.js
+
+const { readBodyBase64, toLowerHeaders } = require('../utils/parseEvent');
 const { parseFileToObjects, detectKind } = require('../utils/fileParser');
-const { looksLikeNFe, transformNfeRows } = require('../transformers/nfe');
+const { looksLikeNFe, transformNfe  } = require('../transformers/nfe');
 
 function pareceTexto(buffer) {
   const head = buffer.slice(0, Math.min(buffer.length, 4096));
@@ -57,9 +59,28 @@ async function prepararArquivo({
     headHex: buffer?.slice(0, 8)?.toString('hex'),
   });
 
+  // NF-e: transforma direto do XML
+  if (looksLikeNFe({ contentType, filename, buffer })) {
+    const linhas = await transformNfe({ xmlBuffer: buffer, filename });
+    const preview = gerarPreview && typeof formatarPreview === 'function'
+      ? formatarPreview(linhas.slice(0, limitePreview))
+      : undefined;
+
+    return {
+      tipo: 'xml-nfe',
+      linhas,
+      preview,
+      arquivo: { buffer, contentType, filename, tamanho: buffer.length },
+    };
+  }
+
+  // Demais tipos: CSV/XLSX via parser genérico
+  const h = toLowerHeaders(headers || {});
+  const limitarLinhasHeader = Number(h['x-limit'] || 0) || 0;
+  const limitarLinhasFinal = Number(limitarLinhas) > 0 ? Number(limitarLinhas) : limitarLinhasHeader;
   let linhas;
   try {
-    linhas = await parseFileToObjects({ buffer, contentType, filename, headers });
+    linhas = await parseFileToObjects({ buffer, contentType, filename, headers: h, limitarLinhas: limitarLinhasFinal });
     console.log('file-kind', { decidedKind: detectKind({ contentType, filename }) });
   } catch (erro) {
     throw erro;
@@ -71,16 +92,12 @@ async function prepararArquivo({
     throw e;
   }
 
-  if (limitarLinhas && limitarLinhas > 0) {
-    linhas = linhas.slice(0, limitarLinhas);
-  }
-
-  if (looksLikeNFe({ contentType, filename, buffer })) {
-    linhas = transformNfeRows(linhas);
+  if (limitarLinhasFinal  > 0) {
+    linhas = linhas.slice(0, limitarLinhasFinal);
   }
 
   const preview = gerarPreview && typeof formatarPreview === 'function'
-    ? formatarPreview(linhas.slice(0, limitePreview))
+    ? formatarPreview(linhas.slice(0, limitarLinhasFinal))
     : undefined;
 
   return {
@@ -95,6 +112,7 @@ async function prepararArquivo({
     },
   };
 }
+
 
 module.exports = {
   prepararArquivo,

@@ -15,12 +15,15 @@ const { executarEnvioIntegracao } = require('./services/envioIntegracaoService')
 
 const INTEGRATION_URL = process.env.INTEGRATION_URL; // URL da lambda-integracao-flowch
 const DEFAULT_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 15000);
+const APIGW_SOFT_TIMEOUT_MS = Number(process.env.APIGW_SOFT_TIMEOUT_MS || 29000);
 const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 5));
 const BATCH_SIZE = Math.max(1, Number(process.env.BATCH_SIZE || CONCURRENCY));
 const PREVIEW_LIMIT = 5;
 const SAFE_MS = Math.max(500, Number(process.env.SAFE_REMAINING_MS || 4000));
 
 async function handler(event, context) {
+  if (context && typeof context.callbackWaitsForEmptyEventLoop === 'boolean') {
+    context.callbackWaitsForEmptyEventLoop = false}
   const iniciouEm = Date.now();
 
   try {
@@ -70,12 +73,16 @@ async function handler(event, context) {
       gerarPreview: preview,
       limitePreview: PREVIEW_LIMIT,
       limitarLinhas: limit > 0 ? limit : undefined,
-      formatarPreview: (registros) => registros
+      formatarPreview: (registros) => {
+        const arr = Array.isArray(registros) ? registros : (registros ? [registros] : []);
+        return arr
         .map((registro) => aplicarConstantes(registro, consts, overrideConsts))
-        .map(limparRegistroPlano),
+        .map(limparRegistroPlano);
+      },
     });
 
-    const linhasArquivo = preparoArquivo.linhas;
+    const linhasArquivoRaw = preparoArquivo?.linhas ?? [];
+    const linhasArquivo = Array.isArray(linhasArquivoRaw) ? linhasArquivoRaw : [linhasArquivoRaw];
     const { filename, contentType } = preparoArquivo.arquivo;
 
     if (useDirect) {
@@ -97,6 +104,8 @@ async function handler(event, context) {
         margemSegurancaMs: SAFE_MS,
         totalLinhas: linhasArquivo.length,
         dryRun,
+        contextoLambda: context,
+        apigwSoftTimeoutMs: APIGW_SOFT_TIMEOUT_MS,
       });
     }
 
