@@ -1,3 +1,4 @@
+// src/services/envioDiretoService.js
 const { sendBatchesDirectToFlowch } = require('../utils/flowchDirectSender');
 const { respostaJson } = require('../utils/httpResponse');
 
@@ -23,9 +24,30 @@ async function executarEnvioDireto({
   dryRun,
   contextoLambda: context,
   apigwSoftTimeoutMs,
+
+  // (opcionais) ajustes do preditor via handler/env
+  etaAlpha,
+  etaMultiplier,
+  etaMinMs,
 }) {
   const tamanhoLote = validarBatchSize(batchSize, 20);
 
+  // Preditor de tempo por lote (EMA)
+  const alpha = Math.max(0.05, Math.min(0.95, Number(process.env.ETA_ALPHA ?? etaAlpha ?? 0.5)));
+  const mult  = Math.max(1, Number(process.env.ETA_MULTIPLIER ?? etaMultiplier ?? 1.25));
+  const etaMin = Math.max(100, Number(process.env.ETA_MIN_MS ?? etaMinMs ?? 600));
+  let etaAvgMs = 0; // média móvel exponencial
+  let etaLastMs = 0; // última medição
+  const etaEstimate = () => {
+    const base = etaAvgMs || etaLastMs || etaMin;
+    return Math.max(etaMin, base) * mult;
+  };
+  const etaUpdate = (ms) => {
+    etaLastMs = ms;
+    etaAvgMs = etaAvgMs ? (alpha * ms + (1 - alpha) * etaAvgMs) : ms;
+  };
+
+  // DRY-RUN
   if (dryRun) {
     const duracao = Date.now() - iniciouEm;
     return respostaJson(200, {
@@ -52,32 +74,69 @@ async function executarEnvioDireto({
     });
   }
 
-  const registrosProcessados = registros;
+  const registrosProcessados = registros || [];
   let indice = Math.min(offsetInicial, registrosProcessados.length);
+
+  // Acumuladores
   const resultados = [];
-  const totais = { size: 0, recordsInserted: 0, recordsUpdated: 0, recordsDeleted: 0 };
+  const totais = { recordsInserted: 0, recordsUpdated: 0, recordsDeleted: 0 };
+  let tentadosTotais = 0;   // enviados ao endpoint (tentativas)
+  let aceitosTotais = 0;    // aceitos (2xx) somando inserted+updated+deleted
+  let indiceAceito = offsetInicial; // offset real (baseado no que entrou)
 
   while (indice < registrosProcessados.length) {
-
+    // Orçamento do API GW (soft timeout)
     const gwLimitMs = Number.isFinite(apigwSoftTimeoutMs) ? apigwSoftTimeoutMs : 29000;
     const elapsed = Date.now() - iniciouEm;
-  
     const budgetAntesDoLote = gwLimitMs - margemSegurancaMs - elapsed;
+
+    // Previsão: se já temos medida de 1+ lotes, decide se cabe outro
+    if (aceitosTotais > 0) {
+      const precisoMs = etaEstimate();
+      if (budgetAntesDoLote <= precisoMs) {
+        const duracao = Date.now() - iniciouEm;
+        return {
+          statusCode: 206,
+          headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
+          body: JSON.stringify({
+            nextOffset: indiceAceito,
+            done: false,
+            summary: {
+              modo: 'direto-flowch',
+              endpointUrl,
+              linhasLidas: totalLinhas,
+              enviadasAprox: aceitosTotais,
+              errosBatches: resultados.filter(r => !(r.statusCode >= 200 && r.statusCode < 300)).length,
+              duracaoMs: duracao,
+              dryRun: false,
+              preview: !!previewAtivo,
+              batchSize: tamanhoLote,
+              totalBatches: resultados.length,
+              uploadId,
+              fileHash,
+              size: aceitosTotais,
+              // attempted: tentadosTotais,
+              // etaMs: precisoMs, budgetMs: budgetAntesDoLote,
+            },
+          }),
+        };
+      }
+    }
+
+    // Guarda “hard” do orçamento
     if (budgetAntesDoLote <= 0) {
-      console.log(`[envioDireto] PRE-GUARD: sem orçamento (gwElapsed=${elapsed}/${gwLimitMs} | margem=${margemSegurancaMs}) -> 206 nextOffset=${indice}`);
       const duracao = Date.now() - iniciouEm;
-      const aceitos = resultados.reduce((t, r) => (r.statusCode >= 200 && r.statusCode < 300 ? t + (r.size || 0) : t), 0);
       return {
         statusCode: 206,
         headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
         body: JSON.stringify({
-          nextOffset: indice,
+          nextOffset: indiceAceito,
           done: false,
           summary: {
             modo: 'direto-flowch',
             endpointUrl,
             linhasLidas: totalLinhas,
-            enviadasAprox: aceitos,
+            enviadasAprox: aceitosTotais,
             errosBatches: resultados.filter(r => !(r.statusCode >= 200 && r.statusCode < 300)).length,
             duracaoMs: duracao,
             dryRun: false,
@@ -86,26 +145,28 @@ async function executarEnvioDireto({
             totalBatches: resultados.length,
             uploadId,
             fileHash,
-            size: totais.size,
+            size: aceitosTotais,
+            // attempted: tentadosTotais,
             recordsInserted: totais.recordsInserted,
             recordsUpdated: totais.recordsUpdated,
             recordsDeleted: totais.recordsDeleted,
           },
         }),
-      };    
+      };
     }
 
     const fim = Math.min(indice + tamanhoLote, registrosProcessados.length);
     const fatia = registrosProcessados.slice(indice, fim);
+    if (fatia.length === 0) break;
 
-      // ----- TIMEOUT EFETIVO DO POST: CAPADO pelo orçamento do gateway -----
+    // Timeout efetivo desta requisição (respeita o budget)
     const timeoutBase = Number.isFinite(timeoutMs) ? timeoutMs : LAMBDA_TIMEOUT_MS;
     const budgetParaRequisicao = Math.max(1000, budgetAntesDoLote - 300); // 300ms folga
     const effectiveTimeoutMs = Math.min(timeoutBase, budgetParaRequisicao);
 
-  console.log(`[envioDireto] efetivoTimeout=${effectiveTimeoutMs}ms | budgetAntes=${budgetAntesDoLote}ms | elapsed=${elapsed}ms | lote=${fatia.length}`);
+    tentadosTotais += fatia.length;
 
-
+    const t0 = Date.now();
     const agregado = await sendBatchesDirectToFlowch({
       endpointUrl,
       token,
@@ -114,18 +175,42 @@ async function executarEnvioDireto({
       timeoutMs: effectiveTimeoutMs,
       method: 'POST',
     });
+    etaUpdate(Date.now() - t0);
 
     resultados.push(...agregado.results);
+
+    // Acumula métricas por resultado e computa ACEITOS no ciclo
+    let aceitosNoCiclo = 0;
     for (const resultado of agregado.results) {
+      const ok = resultado.statusCode >= 200 && resultado.statusCode < 300;
       const corpo = resultado.body || {};
-      totais.size += resultado.size || 0;
-      totais.recordsInserted += corpo.recordsInserted || 0;
-      totais.recordsUpdated += corpo.recordsUpdated || 0;
-      totais.recordsDeleted += corpo.recordsDeleted || 0;
+      const inserted = Number(corpo.recordsInserted || 0);
+      const updated  = Number(corpo.recordsUpdated  || 0);
+      const deleted  = Number(corpo.recordsDeleted  || 0);
+      const aceitosPorContadores = inserted + updated + deleted;
+
+      if (ok) {
+        // usa contadores oficiais quando disponíveis; se vierem 0, cai no fallback
+        const aceitosEste = aceitosPorContadores > 0
+          ? aceitosPorContadores
+          : Number(resultado.size || 0); // fallback: considera tudo aceito
+
+        aceitosNoCiclo += aceitosEste;
+
+        // totais oficiais (sempre somamos os contadores, que podem ser 0)
+        totais.recordsInserted += inserted;
+        totais.recordsUpdated  += updated;
+        totais.recordsDeleted  += deleted;
+      }
     }
 
+    aceitosTotais += aceitosNoCiclo;
+    indiceAceito = offsetInicial + aceitosTotais; // offset real: só o que entrou
+
+    // Cursor local de varredura (independente do aceito)
     indice = fim;
 
+    // Encerramento por orçamento de Lambda ou API GW
     const lambdaRemaining = (context && typeof context.getRemainingTimeInMillis === 'function')
       ? context.getRemainingTimeInMillis()
       : ((Number.isFinite(timeoutMs) ? timeoutMs : LAMBDA_TIMEOUT_MS) - elapsed);
@@ -133,27 +218,19 @@ async function executarEnvioDireto({
     const gwElapsed = Date.now() - iniciouEm;
     const deveEncerrar = (lambdaRemaining <= margemSegurancaMs) || (gwElapsed >= (gwLimitMs - margemSegurancaMs));
 
-    console.log(`[envioDireto] remainingMs=${lambdaRemaining}ms | gwElapsed=${elapsed}/${gwLimitMs}ms | margem=${margemSegurancaMs}ms | indice=${indice}/${registrosProcessados.length}`);
-
-    if(deveEncerrar){
-    const duracao = Date.now() - iniciouEm;
-    const aceitos = resultados.reduce((total, atual) => (
-      atual.statusCode >= 200 && atual.statusCode < 300
-        ? total + atual.size
-        : total
-    ), 0);
-
+    if (deveEncerrar) {
+      const duracao = Date.now() - iniciouEm;
       return {
         statusCode: 206,
         headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
         body: JSON.stringify({
-          nextOffset: indice,
+          nextOffset: indiceAceito,
           done: false,
           summary: {
             modo: 'direto-flowch',
             endpointUrl,
             linhasLidas: totalLinhas,
-            enviadasAprox: aceitos,
+            enviadasAprox: aceitosTotais,
             errosBatches: resultados.filter(r => !(r.statusCode >= 200 && r.statusCode < 300)).length,
             duracaoMs: duracao,
             dryRun: false,
@@ -162,7 +239,8 @@ async function executarEnvioDireto({
             totalBatches: resultados.length,
             uploadId,
             fileHash,
-            size: totais.size,
+            size: aceitosTotais,
+            // attempted: tentadosTotais,
             recordsInserted: totais.recordsInserted,
             recordsUpdated: totais.recordsUpdated,
             recordsDeleted: totais.recordsDeleted,
@@ -172,19 +250,17 @@ async function executarEnvioDireto({
     }
   }
 
+  // Finalizou a varredura deste conjunto
   const duracao = Date.now() - iniciouEm;
-  const aceitos = resultados.reduce((total, atual) => (
-    atual.statusCode >= 200 && atual.statusCode < 300
-      ? total + atual.size
-      : total
-  ), 0);
 
+  // Amostras de erro (até 5)
   const amostrasErro = [];
-  for (const resultado of resultados) {
-    if (!(resultado.statusCode >= 200 && resultado.statusCode < 300) && amostrasErro.length < 5) {
-      const corpoTexto = typeof resultado.body === 'string' ? resultado.body : JSON.stringify(resultado.body);
+  for (const r of resultados) {
+    const ok = r.statusCode >= 200 && r.statusCode < 300;
+    if (!ok && amostrasErro.length < 5) {
+      const corpoTexto = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
       amostrasErro.push({
-        statusCode: resultado.statusCode,
+        statusCode: r.statusCode,
         snippet: String(corpoTexto).slice(0, 400),
       });
     }
@@ -197,7 +273,7 @@ async function executarEnvioDireto({
       modo: 'direto-flowch',
       endpointUrl,
       linhasLidas: totalLinhas,
-      enviadasAprox: aceitos,
+      enviadasAprox: aceitosTotais,
       errosBatches: resultados.filter(r => !(r.statusCode >= 200 && r.statusCode < 300)).length,
       duracaoMs: duracao,
       dryRun: false,
@@ -206,7 +282,7 @@ async function executarEnvioDireto({
       totalBatches: resultados.length,
       uploadId,
       fileHash,
-      size: totais.size,
+      size: aceitosTotais, // total aceito nesta invocação
       recordsInserted: totais.recordsInserted,
       recordsUpdated: totais.recordsUpdated,
       recordsDeleted: totais.recordsDeleted,
