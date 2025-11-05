@@ -226,10 +226,7 @@ function mapearProduto(detNode, parentGuid) {
     item.cofins_vbc    = toDecimal(c?.vBC, 2);
     item.cofins_pcofins= toDecimal(c?.pCOFINS, 4);
     item.cofins_vcofins= toDecimal(c?.vCOFINS, 2);
-  }
-
-  // Campo presente no modelo alvo (fica null; Flowch pode preencher no back)
-  item.C99_FINANCEIRO_NOTA_FISCAL_Id = null;
+  }  
 
   return item;
 }
@@ -315,6 +312,7 @@ async function transformNfe({ xmlBuffer, filename = null, resolveMunicipio = asy
   const det = ensureArray(nfeInf?.det ?? []);
   const produtos   = det.map(d => mapearProduto(d, pai.__recordguid__));
   // Serviços: não existem em NF-e, mantemos vazio (estrutura pronta para NFSe se precisar)
+  console.log(JSON.stringify('GUID DO PAI:', pai.__recordguid__));
   const servicos   = [];
   const duplicatas = mapearDuplicatas(nfeInf, pai.__recordguid__);
   const pagamentos = mapearPagamentos(nfeInf, pai.__recordguid__);
