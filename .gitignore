@@ -6,3 +6,4 @@ node_modules
 .vscode
 .env
 *.zip
+update-src-from-tmp.sh
