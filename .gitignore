@@ -7,3 +7,4 @@ node_modules
 .env
 *.zip
 update-src-from-tmp.sh
+*.tgz
