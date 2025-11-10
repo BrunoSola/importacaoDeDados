@@ -33,9 +33,9 @@ async function executarEnvioDireto({
   const tamanhoLote = validarBatchSize(batchSize, 20);
 
   // Preditor de tempo por lote (EMA)
-  const alpha = Math.max(0.05, Math.min(0.95, Number(process.env.ETA_ALPHA ?? etaAlpha ?? 0.5)));
-  const mult  = Math.max(1, Number(process.env.ETA_MULTIPLIER ?? etaMultiplier ?? 1.25));
-  const etaMin = Math.max(100, Number(process.env.ETA_MIN_MS ?? etaMinMs ?? 600));
+  const alpha = Math.max(0.05, Math.min(0.95, Number(process.env.ETA_ALPHA ?? etaAlpha ?? 0.4)));
+  const mult  = Math.max(1, Number(process.env.ETA_MULTIPLIER ?? etaMultiplier ?? 1.1));
+  const etaMin = Math.max(100, Number(process.env.ETA_MIN_MS ?? etaMinMs ?? 300));
   let etaAvgMs = 0; // média móvel exponencial
   let etaLastMs = 0; // última medição
   const etaEstimate = () => {
@@ -115,6 +115,9 @@ async function executarEnvioDireto({
               uploadId,
               fileHash,
               size: aceitosTotais,
+              recordsInserted: totais.recordsInserted,
+              recordsUpdated:  totais.recordsUpdated,
+              recordsDeleted:  totais.recordsDeleted,
               // attempted: tentadosTotais,
               // etaMs: precisoMs, budgetMs: budgetAntesDoLote,
             },
@@ -161,7 +164,8 @@ async function executarEnvioDireto({
 
     // Timeout efetivo desta requisição (respeita o budget)
     const timeoutBase = Number.isFinite(timeoutMs) ? timeoutMs : LAMBDA_TIMEOUT_MS;
-    const budgetParaRequisicao = Math.max(1000, budgetAntesDoLote - 300); // 300ms folga
+    const overheadMs = Math.max(50, Number(process.env.REQ_OVERHEAD_MS || 200));
+    const budgetParaRequisicao = Math.max(1000, budgetAntesDoLote - overheadMs);
     const effectiveTimeoutMs = Math.min(timeoutBase, budgetParaRequisicao);
 
     tentadosTotais += fatia.length;
@@ -183,24 +187,43 @@ async function executarEnvioDireto({
     let aceitosNoCiclo = 0;
     for (const resultado of agregado.results) {
       const ok = resultado.statusCode >= 200 && resultado.statusCode < 300;
-      const corpo = resultado.body || {};
-      const inserted = Number(corpo.recordsInserted || 0);
-      const updated  = Number(corpo.recordsUpdated  || 0);
-      const deleted  = Number(corpo.recordsDeleted  || 0);
+      let respBody = resultado.body || {};
+      if(typeof respBody === 'string') {
+        const t = respBody.trim();
+        if(t && (t[0] === '{' || t[0] === '[')){
+          try {
+            respBody = JSON.parse(t); 
+          } catch { }
+        }
+      }
+      const inserted = Number(respBody.recordsInserted || 0);
+      const updated  = Number(respBody.recordsUpdated  || 0);
+      const deleted  = Number(respBody.recordsDeleted  || 0);
       const aceitosPorContadores = inserted + updated + deleted;
+
+      // compat extra: quando não há contadores oficiais, usar received/accepted; se não houver, usar o tamanho do lote
+      let compatAceitos = 0;
+      if (aceitosPorContadores === 0) {
+        const received = Number(respBody.received ?? respBody.accepted ?? 0);
+        compatAceitos = Number.isFinite(received) && received > 0 ? received : Number(resultado.size || 0);
+      }
 
       if (ok) {
         // usa contadores oficiais quando disponíveis; se vierem 0, cai no fallback
         const aceitosEste = aceitosPorContadores > 0
           ? aceitosPorContadores
-          : Number(resultado.size || 0); // fallback: considera tudo aceito
+          : compatAceitos;
 
         aceitosNoCiclo += aceitosEste;
 
-        // totais oficiais (sempre somamos os contadores, que podem ser 0)
-        totais.recordsInserted += inserted;
-        totais.recordsUpdated  += updated;
-        totais.recordsDeleted  += deleted;
+        if (aceitosPorContadores > 0) {
+          totais.recordsInserted += inserted;
+          totais.recordsUpdated  += updated;
+          totais.recordsDeleted  += deleted;
+        } else {
+          // alocar compat em inserted para não ficar tudo zerado
+          totais.recordsInserted += compatAceitos;
+        }
       }
     }
 
@@ -258,10 +281,10 @@ async function executarEnvioDireto({
   for (const r of resultados) {
     const ok = r.statusCode >= 200 && r.statusCode < 300;
     if (!ok && amostrasErro.length < 5) {
-      const corpoTexto = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
+      const bodyText = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
       amostrasErro.push({
         statusCode: r.statusCode,
-        snippet: String(corpoTexto).slice(0, 400),
+        snippet: String(bodyText).slice(0, 400),
       });
     }
   }

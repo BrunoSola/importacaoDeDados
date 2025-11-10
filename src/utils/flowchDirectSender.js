@@ -70,30 +70,30 @@ async function sendBatchesDirectToFlowch({
   const resultados = [];
 
   for (let i = 0; i < lotes.length; i++) {
-    const body = lotes[i];
+    const payload = lotes[i];
     const t0 = Date.now();
     const resp = await enviarLote({
       endpointUrl,
       method: method,
       headers,
-      body,
+      payload,
       timeoutMs,
     });
     const duration = Date.now() - t0;
 
-    let bodyStr;
+    let parsed;
     try { 
       const ct = String(resp.headers?.['content-type'] || '');
-      bodyStr = ct.includes('json') ? JSON.parse(resp.body || '{}') : resp.body;
+      parsed = ct.includes('json') ? JSON.parse(resp.body || '{}') : resp.body;
     } catch { 
-      bodyStr = resp.body;  
+      parsed = resp.body;  
     }
     resultados.push({
       batchIndex: i + 1,
-      size: body.length,
+      size: payload.length,
       statusCode: resp.statusCode,
       durationMs: duration,
-      body: bodyStr,
+      body: parsed,
     });    
   }
 
