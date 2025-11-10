@@ -8,9 +8,10 @@ function dividirEmLotes(arr, tamanho) {
   return resultado;
 }
 
-async function enviarLote({ endpointUrl, metodo, cabecalhos, carga, timeoutMs }) {
+async function enviarLote({ endpointUrl, method, headers, body, timeoutMs }) {
   try {
-    return await httpJson(endpointUrl, metodo, cabecalhos, JSON.stringify(carga), timeoutMs);
+    const bodyStr = JSON.stringify(body);
+    return await httpJson(endpointUrl, method, headers, bodyStr, timeoutMs);
   } catch (erro) {
     return {
       statusCode: 599,
@@ -29,33 +30,71 @@ async function sendBatchesDirectToFlowch({
   method = 'POST',
 }) {
   const todos = Array.isArray(records) ? records : [records];
-  const lotes = dividirEmLotes(todos, batchSize);
-  const cabecalhos = { Authorization: `integration ${token}`, 'Content-Type': 'application/json' };
+  const headers = { Authorization: `integration ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' };
 
+  // FAST-PATH: cabe em 1 chamada ⇒ sem criar cópias/lotes
+  if (todos.length <= batchSize){
+    const t0 = Date.now();
+    const resp = await enviarLote({
+      endpointUrl,
+      method: method,
+      headers: headers,
+      body: todos,
+      timeoutMs
+    })
+    const duration = Date.now() - t0;
+    let body;
+    try {
+      const ct = String(resp.headers?.['content-type'] || '');
+      body = ct.includes('json') ? JSON.parse(resp.body || '{}') : resp.body;
+    } catch {
+      body = resp.body;
+    }
+    return {
+      endpointUrl,
+      batchSize,
+      totalBatches: 1,
+      totalRecords: todos.length,
+      results: [{
+        batchIndex: 1,
+        size: todos.length,
+        statusCode: resp.statusCode,
+        durationMs: duration,
+        body,
+      }],
+    };    
+  }
+
+  // Múltiplos lotes (sequencial, preserva comportamento)
+  const lotes = dividirEmLotes(todos, batchSize);
   const resultados = [];
 
   for (let i = 0; i < lotes.length; i++) {
-    const carga = lotes[i];
-    const inicio = Date.now();
-    const resposta = await enviarLote({
+    const body = lotes[i];
+    const t0 = Date.now();
+    const resp = await enviarLote({
       endpointUrl,
-      metodo: method,
-      cabecalhos,
-      carga,
+      method: method,
+      headers,
+      body,
       timeoutMs,
     });
-    const duracao = Date.now() - inicio;
+    const duration = Date.now() - t0;
 
-    let corpoProcessado;
-    try { corpoProcessado = JSON.parse(resposta.body); } catch { corpoProcessado = resposta.body; }
-
+    let bodyStr;
+    try { 
+      const ct = String(resp.headers?.['content-type'] || '');
+      bodyStr = ct.includes('json') ? JSON.parse(resp.body || '{}') : resp.body;
+    } catch { 
+      bodyStr = resp.body;  
+    }
     resultados.push({
       batchIndex: i + 1,
-      size: carga.length,
-      statusCode: resposta.statusCode,
-      durationMs: duracao,
-      body: corpoProcessado,
-    });
+      size: body.length,
+      statusCode: resp.statusCode,
+      durationMs: duration,
+      body: bodyStr,
+    });    
   }
 
   return {
