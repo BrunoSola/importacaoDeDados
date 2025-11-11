@@ -1,32 +1,11 @@
 // src/utils/flowchDirectSender.js
 const { httpJson } = require('../core/httpClient');
-
 const LOG_RESP = process.env.LOG_RESP === '1';
 const LOG_RESP_MAX = Number(process.env.LOG_RESP_MAX || 6);
 let __logCount = 0;
+function logResp(label, batchIndex, resp) { if (!LOG_RESP || __logCount >= LOG_RESP_MAX) return; __logCount++; const status = resp?.statusCode ?? resp?.status ?? resp?.code ?? null; const headers = resp?.headers || {}; const ct = headers['content-type'] || headers['Content-Type'] || ''; const raw = resp?.body; const bodyLen = typeof raw === 'string' ? raw.length : Buffer.isBuffer(raw) ? raw.length : JSON.stringify(raw || '').length; const preview = typeof raw === 'string' ? raw.slice(0, 800) : Buffer.isBuffer(raw) ? raw.toString('utf8', 0, 800) : JSON.stringify(raw || '').slice(0, 800); console.log('[HTTP-RESP]', { label, batchIndex, status, contentType: ct, bodyLen, bodyPreview: preview }); }
 
-function logResp(label, batchIndex, resp) {
-  if (!LOG_RESP || __logCount >= LOG_RESP_MAX) return;
-  __logCount++;
-  const status = resp?.statusCode ?? resp?.status ?? resp?.code ?? null;
-  const headers = resp?.headers || {};
-  const ct = headers['content-type'] || headers['Content-Type'] || '';
-  const raw = resp?.body;
-  const bodyLen = typeof raw === 'string' ? raw.length : Buffer.isBuffer(raw) ? raw.length : JSON.stringify(raw || '').length;
-  const preview = typeof raw === 'string'
-    ? raw.slice(0, 800)
-    : Buffer.isBuffer(raw)
-      ? raw.toString('utf8', 0, 800)
-      : JSON.stringify(raw || '').slice(0, 800);
-  console.log('[HTTP-RESP]', { label, batchIndex, status, contentType: ct, bodyLen, bodyPreview: preview });
-}
-
-function dividirEmLotes(arr, tamanho) {
-  const out = [];
-  const step = Math.max(1, tamanho);
-  for (let i = 0; i < arr.length; i += step) out.push(arr.slice(i, i + step));
-  return out;
-}
+function dividirEmLotes(arr, tamanho) { const out = []; const step = Math.max(1, tamanho); for (let i = 0; i < arr.length; i += step) out.push(arr.slice(i, i + step)); return out; }
 
 async function enviarLote({ endpointUrl, method, headers, body, timeoutMs }) {
   try {
@@ -46,29 +25,40 @@ function tryParseJson(raw) {
   try { return JSON.parse(t); } catch { return raw; }
 }
 
-function normStatus(resp) {
-  return Number(resp?.statusCode ?? resp?.status ?? resp?.code ?? 0);
+function normStatus(resp) { return Number(resp?.statusCode ?? resp?.status ?? resp?.code ?? 0); }
+
+function extractInsertedFromParsed(parsed) {
+  // procura por vários caminhos possíveis no payload de resposta do Flowch
+  if (!parsed) return 0;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  if (parsed.recordsInserted) return n(parsed.recordsInserted);
+  if (parsed.recordsUpdated || parsed.recordsDeleted) return n(parsed.recordsInserted || 0); // se tem updated/deleted mas não inserted
+  if (parsed.data && parsed.data.recordsInserted) return n(parsed.data.recordsInserted);
+  if (parsed.summary && parsed.summary.recordsInserted) return n(parsed.summary.recordsInserted);
+  if (parsed.data && parsed.data.summary && parsed.data.summary.recordsInserted) return n(parsed.data.summary.recordsInserted);
+  if (parsed.received) return n(parsed.received);
+  if (parsed.accepted) return n(parsed.accepted);
+  return 0;
 }
 
-async function sendBatchesDirectToFlowch({
-  endpointUrl,
-  token,
-  records,
-  batchSize = 100,
-  timeoutMs = 15000,
-  method = 'POST',
-}) {
+async function sendBatchesDirectToFlowch({ endpointUrl, token, records, batchSize = 100, timeoutMs = 15000, method = 'POST', }) {
   const todos = Array.isArray(records) ? records : [records];
-  const headers = { Authorization: `integration ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' };
+
+  const baseHeaders = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json'
+  };
 
   // FAST-PATH
   if (todos.length <= batchSize) {
     const t0 = Date.now();
+    const headers = Object.assign({}, baseHeaders, { Authorization: `integration ${token}`, 'X-Batch-Size': String(batchSize), 'X-Batch-Index': '1' });
     const resp = await enviarLote({ endpointUrl, method, headers, body: todos, timeoutMs });
     logResp('fast-path', 1, resp);
     const duration = Date.now() - t0;
     const code = normStatus(resp);
-    const body = tryParseJson(resp.body);
+    const parsed = tryParseJson(resp.body);
+    const inserted = extractInsertedFromParsed(parsed) || todos.length;
     return {
       endpointUrl,
       batchSize,
@@ -79,7 +69,8 @@ async function sendBatchesDirectToFlowch({
         size: todos.length,
         statusCode: code,
         durationMs: duration,
-        body,
+        body: parsed,
+        inserted
       }],
     };
   }
@@ -87,27 +78,23 @@ async function sendBatchesDirectToFlowch({
   // MULTI-LOTES
   const lotes = dividirEmLotes(todos, batchSize);
   const resultados = [];
-
   for (let i = 0; i < lotes.length; i++) {
     const payload = lotes[i];
     const t0 = Date.now();
-    const resp = await enviarLote({
-      endpointUrl,
-      method,
-      headers,
-      body: payload,             // <<< FIX: era "payload"
-      timeoutMs,
-    });
+    const headers = Object.assign({}, baseHeaders, { Authorization: `integration ${token}`, 'X-Batch-Size': String(batchSize), 'X-Batch-Index': String(i + 1) });
+    const resp = await enviarLote({ endpointUrl, method, headers, body: payload, timeoutMs });
     logResp('batch', i + 1, resp);
     const duration = Date.now() - t0;
     const code = normStatus(resp);
     const parsed = tryParseJson(resp.body);
+    const inserted = extractInsertedFromParsed(parsed) || payload.length;
     resultados.push({
       batchIndex: i + 1,
       size: payload.length,
       statusCode: code,
       durationMs: duration,
       body: parsed,
+      inserted
     });
   }
 
