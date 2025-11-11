@@ -3,42 +3,28 @@ const { sendBatchesDirectToFlowch } = require('../utils/flowchDirectSender');
 const { respostaJson } = require('../utils/httpResponse');
 
 const LAMBDA_TIMEOUT_MS = 25000;
-
-// Helpers de status
-const getStatus = (r) => Number(r?.statusCode ?? r?.status ?? r?.code ?? 0);
-const isOk = (r) => {
-  const sc = getStatus(r);
-  return sc >= 200 && sc < 300;
-};
-
-// Modo de aceitação e modo 1-lote
-const ACCEPT_MODE = String(process.env.ACCEPT_MODE || 'optimistic').toLowerCase();
 const SINGLE_BATCH_MODE = String(process.env.SINGLE_BATCH_MODE ?? '1') === '1';
+const ACCEPT_MODE = String(process.env.ACCEPT_MODE || 'optimistic').toLowerCase();
 
-// Normalizadores de contadores vindos da API
-const _num = (v) => {
+// --------- helpers bem diretos ---------
+const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
 
-function extractCounts(body) {
-  const inserted =
-    _num(body?.recordsInserted) ||
-    _num(body?.data?.recordsInserted) ||
-    _num(body?.summary?.recordsInserted) ||
-    (Array.isArray(body?.records) ? body.records.length : 0) ||
-    _num(body?.received) ||
-    _num(body?.accepted);
+const safeParse = (maybeJson) => {
+  if (typeof maybeJson !== 'string') return (maybeJson || {});
+  const s = maybeJson.trim();
+  if (!s || (s[0] !== '{' && s[0] !== '[')) return {};
+  try { return JSON.parse(s); } catch { return {}; }
+};
 
-  const updated = _num(body?.recordsUpdated);
-  const deleted = _num(body?.recordsDeleted);
+const getStatus = (r) => Number(r?.statusCode ?? r?.status ?? r?.code ?? 0);
+const isOk      = (r) => { const sc = getStatus(r); return sc >= 200 && sc < 300; };
 
-  return { inserted, updated, deleted };
-}
-
-function countErrors(arr) {
+const countErrors = (arr) => {
   if (ACCEPT_MODE === 'optimistic') {
-    // Só conta falhas de transporte
+    // só falhas grosseiras de transporte
     return arr.filter((r) => {
       const sc = getStatus(r);
       return !sc || sc === 599;
@@ -46,8 +32,32 @@ function countErrors(arr) {
   }
   // strict: qualquer não-2xx
   return arr.filter((r) => !isOk(r)).length;
+};
+
+/**
+ * Extrai contadores do corpo devolvido pela API.
+ * Prioriza recordsInserted/Updated/Deleted; se inclusão devolver "records: [{Id}]",
+ * usamos o length como inserted.
+ */
+function extractCounts(bodyRaw) {
+  const body = safeParse(bodyRaw);
+  const inserted =
+    num(body.recordsInserted) ||
+    num(body?.data?.recordsInserted) ||
+    num(body?.summary?.recordsInserted) ||
+    (Array.isArray(body.records) ? body.records.length : 0) ||
+    num(body.received) || // compat
+    num(body.accepted);   // compat
+
+  const updated = num(body.recordsUpdated);
+  const deleted = num(body.recordsDeleted);
+  return { inserted, updated, deleted, body };
 }
 
+/**
+ * Monta o summary padronizado.
+ * "enviadasAprox" e "size" são os confirmados (inserted+updated+deleted).
+ */
 function buildSummary({
   endpointUrl,
   totalLinhas,
@@ -59,14 +69,12 @@ function buildSummary({
   iniciouEm,
   offsetInicial,
   indiceAceito,
-  totais
+  totais,
 }) {
   const duracao = Date.now() - iniciouEm;
-
-  // Fonte única da verdade: counters confirmados pela API
   const confirmados =
     (totais.recordsInserted + totais.recordsUpdated + totais.recordsDeleted) ||
-    Math.max(0, indiceAceito - offsetInicial); // fallback
+    Math.max(0, indiceAceito - offsetInicial);
 
   return {
     modo: 'direto-flowch',
@@ -83,15 +91,29 @@ function buildSummary({
     fileHash,
     size: confirmados,
     recordsInserted: totais.recordsInserted,
-    recordsUpdated: totais.recordsUpdated,
-    recordsDeleted: totais.recordsDeleted
+    recordsUpdated:  totais.recordsUpdated,
+    recordsDeleted:  totais.recordsDeleted,
   };
 }
 
-function validarBatchSize(valor, padrao) {
-  return Number.isFinite(valor) && valor > 0 ? valor : padrao;
+/**
+ * Calcula orçamento de tempo para o request atual, com fallback seguro.
+ */
+function calcEffectiveTimeout({ iniciouEm, apigwSoftTimeoutMs, margemSegurancaMs, timeoutMs }) {
+  const gwLimitMs = Number.isFinite(apigwSoftTimeoutMs) ? apigwSoftTimeoutMs : 29000;
+  const msSafe    = Number.isFinite(margemSegurancaMs) ? margemSegurancaMs : Number(process.env.SAFE_REMAINING_MS || 4000);
+  const elapsed   = Date.now() - iniciouEm;
+  const budget    = gwLimitMs - msSafe - elapsed;
+
+  const timeoutBase        = Number.isFinite(timeoutMs) ? timeoutMs : LAMBDA_TIMEOUT_MS;
+  const overheadMs         = Math.max(50, Number(process.env.REQ_OVERHEAD_MS || 200));
+  const budgetRequisicao   = Math.max(1000, budget - overheadMs);
+  const effectiveTimeoutMs = Math.max(800, Math.min(timeoutBase, budgetRequisicao));
+
+  return { effectiveTimeoutMs, budget };
 }
 
+// --------- função principal, fluxo linear e comentado ---------
 async function executarEnvioDireto({
   registros,
   offsetInicial,
@@ -108,225 +130,146 @@ async function executarEnvioDireto({
   dryRun,
   contextoLambda: context,
   apigwSoftTimeoutMs,
-
-  // (opcionais) ajustes do preditor via handler/env
+  // (opcionais) ajustes do preditor via handler/env (mantidos para compat)
   etaAlpha,
   etaMultiplier,
-  etaMinMs
+  etaMinMs,
 }) {
-  const tamanhoLote = validarBatchSize(batchSize, 20);
+  const tamanhoLote = num(batchSize) > 0 ? Number(batchSize) : 20;
 
-  // Preditor (EMA) – suavização de tempo por lote
-  const alpha = Math.max(0.05, Math.min(0.95, Number(process.env.ETA_ALPHA ?? etaAlpha ?? 0.4)));
-  const mult = Math.max(1, Number(process.env.ETA_MULTIPLIER ?? etaMultiplier ?? 1.1));
-  const etaMin = Math.max(100, Number(process.env.ETA_MIN_MS ?? etaMinMs ?? 300));
-  let etaAvgMs = 0;
-  let etaLastMs = 0;
-  const etaEstimate = () => Math.max(etaMin, (etaAvgMs || etaLastMs || etaMin)) * mult;
-  const etaUpdate = (ms) => {
-    etaLastMs = ms;
-    etaAvgMs = etaAvgMs ? alpha * ms + (1 - alpha) * etaAvgMs : ms;
-  };
-
-  // Dry-run
+  // DRY-RUN: só devolve o esqueleto
   if (dryRun) {
-    const duracao = Date.now() - iniciouEm;
-    return respostaJson(200, {
-      nextOffset: offsetInicial,
-      done: true,
-      summary: {
-        modo: 'direto-flowch',
-        endpointUrl,
-        linhasLidas: totalLinhas,
-        enviadasAprox: 0,
-        errosBatches: 0,
-        duracaoMs: duracao,
-        dryRun: true,
-        preview: !!previewAtivo,
-        batchSize: tamanhoLote,
-        totalBatches: 0,
-        uploadId,
-        fileHash,
-        size: 0,
-        recordsInserted: 0,
-        recordsUpdated: 0,
-        recordsDeleted: 0
-      }
-    });
+    const summary = {
+      modo: 'direto-flowch',
+      endpointUrl,
+      linhasLidas: totalLinhas,
+      enviadasAprox: 0,
+      errosBatches: 0,
+      duracaoMs: Date.now() - iniciouEm,
+      dryRun: true,
+      preview: !!previewAtivo,
+      batchSize: tamanhoLote,
+      totalBatches: 0,
+      uploadId,
+      fileHash,
+      size: 0,
+      recordsInserted: 0,
+      recordsUpdated: 0,
+      recordsDeleted: 0,
+    };
+    return respostaJson(200, { nextOffset: offsetInicial, done: true, summary });
   }
 
-  const registrosProcessados = registros || [];
-  let indice = Math.min(offsetInicial, registrosProcessados.length);
+  // Cursor de leitura no arquivo/matriz
+  const todos = Array.isArray(registros) ? registros : [];
+  let indice   = Math.min(offsetInicial || 0, todos.length);
 
-  // Acumuladores
+  // Acumuladores desta invocação
   const resultados = [];
-  const totais = { recordsInserted: 0, recordsUpdated: 0, recordsDeleted: 0 };
-  let aceitosTotais = 0; // soma confirmada pelo servidor nesta invocação
-  let indiceAceito = offsetInicial;
+  const totais     = { recordsInserted: 0, recordsUpdated: 0, recordsDeleted: 0 };
+  let aceitosTotais   = 0;
+  let indiceAceito    = offsetInicial || 0;
 
-  while (indice < registrosProcessados.length) {
-    // Orçamento do API Gateway
-    const gwLimitMs = Number.isFinite(apigwSoftTimeoutMs) ? apigwSoftTimeoutMs : 29000;
-    const elapsed = Date.now() - iniciouEm;
-    const budgetAntesDoLote = gwLimitMs - margemSegurancaMs - elapsed;
-
-    // ⚠️ Nunca retornar 206 antes de enviar o PRIMEIRO lote desta invocação
-    const isPrimeiroLoteDestaInvocacao = resultados.length === 0;
-    if (!isPrimeiroLoteDestaInvocacao) {
-      const precisoMs = etaEstimate();
-      if (budgetAntesDoLote <= precisoMs || budgetAntesDoLote <= 0) {
-        return {
-          statusCode: 206,
-          headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
-          body: JSON.stringify({
-            nextOffset: indiceAceito,
-            done: false,
-            summary: buildSummary({
-              endpointUrl,
-              totalLinhas,
-              previewAtivo,
-              tamanhoLote,
-              resultados,
-              uploadId,
-              fileHash,
-              iniciouEm,
-              offsetInicial,
-              indiceAceito,
-              totais
-            })
-          })
-        };
-      }
-    }
-
-    const fim = Math.min(indice + tamanhoLote, registrosProcessados.length);
-    const fatia = registrosProcessados.slice(indice, fim);
+  // === enviamos APENAS 1 LOTE por invocação (SINGLE_BATCH_MODE padrão) ===
+  // Ainda deixamos num while pra manter compat se mudar a flag futuramente.
+  while (indice < todos.length) {
+    // fatia do lote
+    const fim   = Math.min(indice + tamanhoLote, todos.length);
+    const fatia = todos.slice(indice, fim);
     if (fatia.length === 0) break;
 
-    const timeoutBase = Number.isFinite(timeoutMs) ? timeoutMs : LAMBDA_TIMEOUT_MS;
-    const overheadMs = Math.max(50, Number(process.env.REQ_OVERHEAD_MS || 200));
-    const budgetParaRequisicao = Math.max(1000, budgetAntesDoLote - overheadMs);
-    const effectiveTimeoutMs = Math.max(800, Math.min(timeoutBase, budgetParaRequisicao)); // garante 1ª tentativa
+    // calcular timeout efetivo com base no budget restante
+    const { effectiveTimeoutMs, budget } = calcEffectiveTimeout({
+      iniciouEm,
+      apigwSoftTimeoutMs,
+      margemSegurancaMs,
+      timeoutMs,
+    });
 
-    const t0 = Date.now();
+    // GARANTIA: no primeiro lote da invocação, enviamos mesmo com pouco budget
+    // (o effectiveTimeout já respeita piso).
     const agregado = await sendBatchesDirectToFlowch({
       endpointUrl,
       token,
       records: fatia,
       batchSize: tamanhoLote,
       timeoutMs: effectiveTimeoutMs,
-      method: 'POST'
+      method: 'POST',
     });
-    etaUpdate(Date.now() - t0);
-    resultados.push(...agregado.results);
 
-    // Somar com base no que o SERVIDOR confirmou
-    let aceitosNoCiclo = 0;
-    for (const resultado of agregado.results) {
-      let body = resultado.body || {};
-      if (typeof body === 'string') {
-        const s = body.trim();
-        if (s && (s[0] === '{' || s[0] === '[')) {
-          try { body = JSON.parse(s); } catch { body = {}; }
-        } else {
-          body = {};
-        }
-      }
-
-      const { inserted, updated, deleted } = extractCounts(body);
-      const byCounters = inserted + updated + deleted;
-
-      let aceitosEste = 0;
-      if (byCounters > 0) {
-        aceitosEste = byCounters;
-        totais.recordsInserted += inserted;
-        totais.recordsUpdated += updated;
-        totais.recordsDeleted += deleted;
-      } else {
-        // último fallback: tamanho do lote enviado
-        aceitosEste = Number(resultado.size || 0);
-        totais.recordsInserted += aceitosEste;
-      }
-      aceitosNoCiclo += aceitosEste;
+    // proteger contra retorno vazio (ex.: erro de rede encapsulado)
+    if (!agregado?.results || agregado.results.length === 0) {
+      const summary = buildSummary({
+        endpointUrl, totalLinhas, previewAtivo, tamanhoLote,
+        resultados, uploadId, fileHash, iniciouEm, offsetInicial, indiceAceito, totais,
+      });
+      return {
+        statusCode: 206,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
+        body: JSON.stringify({ nextOffset: indiceAceito, done: false, summary }),
+      };
     }
 
-    aceitosTotais += aceitosNoCiclo;
-    indiceAceito = offsetInicial + aceitosTotais;
+    // acumular contadores vindos do servidor
+    resultados.push(...agregado.results);
+    let aceitosNoLote = 0;
 
-    // Cursor local segue leitura sequencial do arquivo
-    indice = fim;
+    for (const r of agregado.results) {
+      const { inserted, updated, deleted } = extractCounts(r.body);
+      const byCounters = inserted + updated + deleted;
 
-    // 1 lote por invocação (padrão)
+      if (byCounters > 0) {
+        aceitosNoLote                += byCounters;
+        totais.recordsInserted       += inserted;
+        totais.recordsUpdated        += updated;
+        totais.recordsDeleted        += deleted;
+      } else {
+        // fallback: se o servidor não informou contadores, usamos tamanho do lote
+        const fallback = num(r.size);
+        aceitosNoLote          += fallback;
+        totais.recordsInserted += fallback;
+      }
+    }
+
+    aceitosTotais += aceitosNoLote;
+    indiceAceito   = (offsetInicial || 0) + aceitosTotais;
+
+    // avançar leitura do arquivo (os não-aceitos serão reprocessados na próxima chamada)
+    indice = SINGLE_BATCH_MODE ? fim : Math.max(indiceAceito, indice);
+
+    // encerramento (1 lote por execução)
+    const temMais = fim < todos.length;
+    const summary = buildSummary({
+      endpointUrl, totalLinhas, previewAtivo, tamanhoLote,
+      resultados, uploadId, fileHash, iniciouEm, offsetInicial, indiceAceito, totais,
+    });
+
     if (SINGLE_BATCH_MODE) {
-      const temMais = fim < registrosProcessados.length;
-      const summary = buildSummary({
-        endpointUrl,
-        totalLinhas,
-        previewAtivo,
-        tamanhoLote,
-        resultados,
-        uploadId,
-        fileHash,
-        iniciouEm,
-        offsetInicial,
-        indiceAceito,
-        totais
-      });
       if (temMais) {
         return {
           statusCode: 206,
           headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
-          body: JSON.stringify({ nextOffset: indiceAceito, done: false, summary })
+          body: JSON.stringify({ nextOffset: indiceAceito, done: false, summary }),
         };
       }
       return respostaJson(200, { nextOffset: null, done: true, summary });
     }
 
-    // (Multi-lotes: respeita orçamento)
-    const gwElapsed = Date.now() - iniciouEm;
-    const deveEncerrar =
-      gwElapsed >= (Number.isFinite(apigwSoftTimeoutMs) ? apigwSoftTimeoutMs : 29000) - margemSegurancaMs;
-
-    if (deveEncerrar) {
+    // (multi-lotes): só continua se houver budget; senão, devolve 206
+    if (budget <= 0) {
       return {
         statusCode: 206,
         headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
-        body: JSON.stringify({
-          nextOffset: indiceAceito,
-          done: false,
-          summary: buildSummary({
-            endpointUrl,
-            totalLinhas,
-            previewAtivo,
-            tamanhoLote,
-            resultados,
-            uploadId,
-            fileHash,
-            iniciouEm,
-            offsetInicial,
-            indiceAceito,
-            totais
-          })
-        })
+        body: JSON.stringify({ nextOffset: indiceAceito, done: false, summary }),
       };
     }
   }
 
-  // Conclusão
+  // terminou tudo
   const summary = buildSummary({
-    endpointUrl,
-    totalLinhas,
-    previewAtivo,
-    tamanhoLote,
-    resultados,
-    uploadId,
-    fileHash,
-    iniciouEm,
-    offsetInicial,
-    indiceAceito,
-    totais
+    endpointUrl, totalLinhas, previewAtivo, tamanhoLote,
+    resultados, uploadId, fileHash, iniciouEm, offsetInicial, indiceAceito, totais,
   });
-
   return respostaJson(200, { nextOffset: null, done: true, summary });
 }
 
