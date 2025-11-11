@@ -8,5 +8,15 @@
     "exceljs": "^4.4.0",
     "fast-xml-parser": "^4.5.3",
     "iconv-lite": "^0.7.0"
+  },
+  "scripts": {
+    "test:preview": "node local-tests/runPreviewAll.js",
+    "test:preview:check": "node local-tests/checkPreview.js",
+    "test:preview:only": "node local-tests/previewParseOnly.js",
+    "test:direto": "node local-tests/runDiretoAll.js",
+    "test:integ": "node local-tests/runIntegracaoAll.js",
+    "mock:flowch": "node local-tests/mockFlowchServer.js",
+    "mock:integ": "node local-tests/mockIntegrationServer.js",
+    "test:samples": "node local-tests/samplePayloads.js"
   }
 }

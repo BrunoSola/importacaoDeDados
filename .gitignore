@@ -1,10 +1,45 @@
-﻿node_modules
-.vscode
+﻿# Node & Lambda – ignore list
+
+# Dependências / IDE
+node_modules/
+.vscode/
+.idea/
+
+# Ambientes/segredos
 .env
+.env.*
+*.pem
+*.key
+
+# Logs / cache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+.cache/
+.tmp/
+
+# Build / artefatos de deploy
+dist/
 *.zip
-node_modules
-.vscode
-.env
-*.zip
-update-src-from-tmp.sh
 *.tgz
+
+# Test harness local (não versionar)
+local-tests/
+payload-samples/
+scripts/
+
+# Saídas de preview/local
+preview.json
+preview-*.json
+preview-only-*.json
+
+# Arquivos de exemplo locais (não enviar)
+Cidades.xlsx
+sample*.csv
+sample*.xlsx
+
+# SO / lixo comum
+.DS_Store
+Thumbs.db
