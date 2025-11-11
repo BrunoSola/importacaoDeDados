@@ -2,45 +2,30 @@
 const { httpJson } = require('../core/httpClient');
 
 const LOG_RESP = process.env.LOG_RESP === '1';
-const LOG_RESP_MAX = Number(process.env.LOG_RESP_MAX || 6); // no máx. 6 lotes logados
+const LOG_RESP_MAX = Number(process.env.LOG_RESP_MAX || 6);
 let __logCount = 0;
 
 function logResp(label, batchIndex, resp) {
   if (!LOG_RESP || __logCount >= LOG_RESP_MAX) return;
   __logCount++;
-
   const status = resp?.statusCode ?? resp?.status ?? resp?.code ?? null;
   const headers = resp?.headers || {};
   const ct = headers['content-type'] || headers['Content-Type'] || '';
-  const keys = Object.keys(resp || {});
   const raw = resp?.body;
-
-  let preview = '';
-  let bodyLen = 0;
-  if (raw == null) {
-    preview = '<empty>';
-  } else if (typeof raw === 'string') {
-    bodyLen = raw.length;
-    preview = raw.slice(0, 800);
-  } else if (Buffer.isBuffer(raw)) {
-    bodyLen = raw.length;
-    preview = raw.toString('utf8', 0, 800);
-  } else {
-    const s = JSON.stringify(raw);
-    bodyLen = s.length;
-    preview = s.slice(0, 800);
-  }
-
-  console.log('[HTTP-RESP]', {
-    label, batchIndex, status, contentType: ct, respKeys: keys, bodyType: typeof raw, bodyLen, bodyPreview: preview,
-  });
+  const bodyLen = typeof raw === 'string' ? raw.length : Buffer.isBuffer(raw) ? raw.length : JSON.stringify(raw || '').length;
+  const preview = typeof raw === 'string'
+    ? raw.slice(0, 800)
+    : Buffer.isBuffer(raw)
+      ? raw.toString('utf8', 0, 800)
+      : JSON.stringify(raw || '').slice(0, 800);
+  console.log('[HTTP-RESP]', { label, batchIndex, status, contentType: ct, bodyLen, bodyPreview: preview });
 }
 
 function dividirEmLotes(arr, tamanho) {
-  const resultado = [];
-  const limite = Math.max(1, tamanho);
-  for (let i = 0; i < arr.length; i += limite) resultado.push(arr.slice(i, i + limite));
-  return resultado;
+  const out = [];
+  const step = Math.max(1, tamanho);
+  for (let i = 0; i < arr.length; i += step) out.push(arr.slice(i, i + step));
+  return out;
 }
 
 async function enviarLote({ endpointUrl, method, headers, body, timeoutMs }) {
@@ -48,15 +33,10 @@ async function enviarLote({ endpointUrl, method, headers, body, timeoutMs }) {
     const bodyStr = JSON.stringify(body);
     return await httpJson(endpointUrl, method, headers, bodyStr, timeoutMs);
   } catch (erro) {
-    return {
-      statusCode: 599,
-      headers: {},
-      body: JSON.stringify({ error: erro.message || 'network error' }),
-    };
+    return { statusCode: 599, headers: {}, body: JSON.stringify({ error: erro.message || 'network error' }) };
   }
 }
 
-// parse tolerante: tenta JSON quando a string começa com { ou [
 function tryParseJson(raw) {
   if (typeof raw !== 'string') return raw;
   const t = raw.trim();
@@ -66,7 +46,6 @@ function tryParseJson(raw) {
   try { return JSON.parse(t); } catch { return raw; }
 }
 
-// normaliza status para número
 function normStatus(resp) {
   return Number(resp?.statusCode ?? resp?.status ?? resp?.code ?? 0);
 }
@@ -82,16 +61,14 @@ async function sendBatchesDirectToFlowch({
   const todos = Array.isArray(records) ? records : [records];
   const headers = { Authorization: `integration ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' };
 
-  // FAST-PATH: cabe em 1 chamada ⇒ sem criar cópias/lotes
+  // FAST-PATH
   if (todos.length <= batchSize) {
     const t0 = Date.now();
     const resp = await enviarLote({ endpointUrl, method, headers, body: todos, timeoutMs });
     logResp('fast-path', 1, resp);
-
     const duration = Date.now() - t0;
     const code = normStatus(resp);
     const body = tryParseJson(resp.body);
-
     return {
       endpointUrl,
       batchSize,
@@ -107,7 +84,7 @@ async function sendBatchesDirectToFlowch({
     };
   }
 
-  // Múltiplos lotes (sequencial, preserva comportamento)
+  // MULTI-LOTES
   const lotes = dividirEmLotes(todos, batchSize);
   const resultados = [];
 
@@ -118,31 +95,23 @@ async function sendBatchesDirectToFlowch({
       endpointUrl,
       method,
       headers,
-      body: payload,            // <<< FIX: era "payload", agora envia no campo correto
+      body: payload,             // <<< FIX: era "payload"
       timeoutMs,
     });
-    logResp('batch', i + 1, resp); // <<< FIX: label e índice corretos
-
+    logResp('batch', i + 1, resp);
     const duration = Date.now() - t0;
     const code = normStatus(resp);
     const parsed = tryParseJson(resp.body);
-
     resultados.push({
       batchIndex: i + 1,
       size: payload.length,
-      statusCode: code,         // <<< FIX: status sempre numérico
+      statusCode: code,
       durationMs: duration,
-      body: parsed,             // <<< FIX: parse tolerante (JSON mesmo com text/plain)
+      body: parsed,
     });
   }
 
-  return {
-    endpointUrl,
-    batchSize,
-    totalBatches: resultados.length,
-    totalRecords: todos.length,
-    results: resultados,
-  };
+  return { endpointUrl, batchSize, totalBatches: resultados.length, totalRecords: todos.length, results: resultados };
 }
 
 module.exports = { sendBatchesDirectToFlowch };
