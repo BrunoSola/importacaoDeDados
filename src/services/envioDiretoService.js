@@ -60,8 +60,8 @@ const isCountedAsError = (r) => {
 
 // ---------- Extração de contadores da resposta ----------
 /**
- * Lê counters típicos (recordsInserted/Updated/Deleted) e tenta inferir duplicatas
- * a partir de campos comuns e/ou lista de erros.
+ * Lê counters típicos (recordsInserted/Updated/Deleted) e conta duplicatas
+ * SOMENTE via posapp_fields_error_message (valor 'ALREADY_EXISTS').
  */
 function extractCounts(bodyRaw) {
   const body = safeParseIfJson(bodyRaw);
@@ -77,26 +77,19 @@ function extractCounts(bodyRaw) {
   const updated = num(body.recordsUpdated);
   const deleted = num(body.recordsDeleted);
 
-  // Heurística de duplicatas
+  // ===== Duplicatas apenas via posapp_fields_error_message =====
   let alreadyExists = 0;
-  const sumLike = (...vals) => vals.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
-
-  alreadyExists += sumLike(
-    num(body.alreadyExists),
-    num(body.duplicates),
-    num(body.skippedDuplicates),
-    num(body?.data?.alreadyExists),
-    num(body?.summary?.alreadyExists),
-  );
-
   const errorsArr = Array.isArray(body.errors) ? body.errors
                   : Array.isArray(body?.data?.errors) ? body.data.errors
                   : [];
+
   for (const e of errorsArr) {
-    const code = String(e?.code || '').toUpperCase();
-    const msg  = String(e?.message || '').toLowerCase();
-    if (code === 'ALREADY_EXISTS' || msg.includes('already_exist') || msg.includes('já cadastr') || msg.includes('duplic')) {
-      alreadyExists += 1;
+    const pfem = e?.erro?.posapp_fields_error_message;
+    if (Array.isArray(pfem)) {
+      for (const item of pfem) {
+        const val = String(Object.values(item || {})[0] ?? '').toUpperCase();
+        if (val === 'ALREADY_EXISTS') alreadyExists += 1;
+      }
     }
   }
 
@@ -269,6 +262,41 @@ async function sendDuplicateAware({
   const firstStatus = getStatus(aggregated.results[0]);
   const mergedCounts = extractCounts(aggregated.results[0]?.body || '{}');
 
+  // === Erro fatal de schema (coluna inexistente etc.) ===
+  const first = aggregated.results[0];
+  const firstBodyStr = typeof first?.body === 'string' ? first.body : JSON.stringify(first?.body || {});
+  const parsed = safeParseIfJson(firstBodyStr);
+
+  const e0 = parsed?.errors?.[0]?.erro || {};
+  const sqlCode  = String(e0.code || '').toUpperCase();
+  const sqlMsg   = String(e0.sqlMessage || '').toLowerCase();
+  const sqlState = String(e0.sqlState || '');
+
+  // Regras fatais: ER_BAD_FIELD_ERROR / "unknown column" / 42S22 (MySQL)
+  const isSchemaError =
+    sqlCode === 'ER_BAD_FIELD_ERROR' ||
+    sqlState === '42S22' ||
+    sqlMsg.includes('unknown column');
+
+  const totalChanges = mergedCounts.inserted + mergedCounts.updated + mergedCounts.deleted;
+  const houveProgresso = (totalChanges > 0) || (mergedCounts.alreadyExists > 0);
+
+  if (!houveProgresso && isSchemaError) {
+    return {
+      accepted: 0, inserted: 0, updated: 0, deleted: 0,
+      skippedDuplicates: 0,
+      errosBatchesCountDelta,
+      batchesUsed: 1,
+      budgetLeft: null,
+      usedAdaptiveSplit: false,
+      fatalError: {
+        statusCode: 400,
+        body: firstBodyStr,
+        headers: first?.headers || {},
+      },
+    };
+  }
+
   // Caso feliz: houve mudanças confirmadas
   if (anyOk && (inserted + updated + deleted) > 0) {
     dbg('decision', { kind: 'accepted', changes: inserted + updated + deleted });
@@ -433,6 +461,22 @@ async function executarEnvioDireto({
       iniciouEm, apigwSoftTimeoutMs, margemSegurancaMs, timeoutMs,
     });
 
+    // Se houve erro fatal de schema e nenhum progresso, propaga 4xx do upstream
+    const progressoFatia = (res.accepted || 0) + (res.skippedDuplicates || 0);
+    if (res.fatalError && progressoFatia === 0) {
+      const baseHeaders = {
+        'Content-Type': 'application/json',
+        'Retry-After': String(RETRY_AFTER_SECS),
+        'x-batch-size': String(batchNominal),
+        'x-suggest-batch-size': String(batchEfetivo),
+      };
+      return {
+        statusCode: res.fatalError.statusCode || 400,
+        headers: baseHeaders,
+        body: res.fatalError.body || JSON.stringify({ error: 'Upstream error' }),
+      };
+    }
+
     // Consolida métricas
     totais.recordsInserted += res.inserted;
     totais.recordsUpdated  += res.updated;
@@ -441,7 +485,6 @@ async function executarEnvioDireto({
     totalBatches           += Math.max(1, res.batchesUsed);
     skippedDuplicates      += res.skippedDuplicates;
 
-    const progressoFatia = res.accepted + res.skippedDuplicates;
     aceitosTotais += progressoFatia;
     indiceAceito   = (offsetInicial || 0) + aceitosTotais;
 
