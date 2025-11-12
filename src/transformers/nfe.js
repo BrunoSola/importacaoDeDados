@@ -100,8 +100,8 @@ function mapearPai(parsed) {
   out.ambiente = prot?.infProt?.tpAmb ?? prot?.tpAmb ?? ide?.tpAmb ?? null;
 
   // Município / UF
-  out.municipio_ibge_raw = ide?.cMunFG ?? null;
-  out.municipio_id       = null; // será preenchido externamente (resolveMunicipio)
+  out.municipio_ibge = ide?.cMunFG ?? null;
+  //out.municipio_id       = null; // será preenchido externamente (resolveMunicipio)
   out.uf = emit?.enderEmit?.UF ?? emit?.enderEmit?.uf ?? null;
 
   // Observações / chave / flags
@@ -208,7 +208,7 @@ function mapearProduto(detNode, parentGuid) {
     item.fcp_pfcp    = toDecimal(icmsObj?.pFCP, 4);
     item.fcp_vfcp    = toDecimal(icmsObj?.vFCP, 2);
     item.fcp_vbcfcp  = toDecimal(icmsObj?.vBCFCP, 2);
-    
+
     item.fcp_st_pfcp   = toDecimal(icmsObj?.pFCPST, 4);
     item.fcp_st_vfcp   = toDecimal(icmsObj?.vFCPST, 2);
     item.fcp_st_vbcfcp = toDecimal(icmsObj?.vBCFCPST, 2);
@@ -311,18 +311,6 @@ async function transformNfe({ xmlBuffer, filename = null, resolveMunicipio = asy
 
   // Pai
   const pai = mapearPai(parsed);
-
-  // Municipio_id por função externa (mantém performance e responsabilidades separadas)
-  const ibge = pai.municipio_ibge_raw ?? null;
-  if (ibge) {
-    try {
-      const mid = await resolveMunicipio(String(ibge));
-      pai.municipio_id = mid ?? null;
-    } catch (err) {
-      logger.error('resolveMunicipio error:', err?.message || err);
-      throw err;
-    }
-  }
 
   // Filhos
   const det = ensureArray(nfeInf?.det ?? []);
