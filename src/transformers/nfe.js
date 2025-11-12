@@ -204,6 +204,14 @@ function mapearProduto(detNode, parentGuid) {
     item.icms_vbcst      = toDecimal(icmsObj?.vBCST, 2);
     item.icms_picmsst    = toDecimal(icmsObj?.pICMSST, 4);
     item.icms_vicmsst    = toDecimal(icmsObj?.vICMSST, 2);
+
+    item.fcp_pfcp    = toDecimal(icmsObj?.pFCP, 4);
+    item.fcp_vfcp    = toDecimal(icmsObj?.vFCP, 2);
+    item.fcp_vbcfcp  = toDecimal(icmsObj?.vBCFCP, 2);
+    
+    item.fcp_st_pfcp   = toDecimal(icmsObj?.pFCPST, 4);
+    item.fcp_st_vfcp   = toDecimal(icmsObj?.vFCPST, 2);
+    item.fcp_st_vbcfcp = toDecimal(icmsObj?.vBCFCPST, 2);
   }
 
   const ipi = imp?.IPI ?? null;
