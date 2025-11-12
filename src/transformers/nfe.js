@@ -76,8 +76,16 @@ function mapearPai(parsed) {
   out.serie  = ide?.serie ?? null;
   out.numero = ide?.nNF ?? null;
 
+  out.codigo_numerico     = ide?.cNF ?? null; // Código numérico da NF-e
+  out.digito_verificador  = ide?.cDV ?? null; // DV da chave de acesso
+
   out.data_emissao        = toIsoDatetime(ide?.dhEmi ?? ide?.dEmi ?? null);
   out.data_saida_entrada  = toIsoDatetime(ide?.dhSaiEnt ?? ide?.dSaiEnt ?? null);
+
+  out.processo_emissao   = ide?.procEmi ?? null;   // 0=aplicativo do contribuinte, 1=avulsa, etc.
+  out.versao_do_emissor  = ide?.verProc ?? null;   // ex.: "2.0.7"
+  out.tipo_impressao     = ide?.tpImp ?? null;     // 0=Sem DANFE, 1=Retrato, 2=Paisagem...
+  out.tipo_emissao       = ide?.tpEmis ?? null;    // 1=Normal, 2=Contingência FS, ...
 
   // Competência = AAAA-MM-01 (se houver data de emissão)
   if (out.data_emissao) {
