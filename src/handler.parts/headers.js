@@ -6,7 +6,7 @@
 //   - cfg.headers / cfg.headersRaw: headers minúsculos e originais
 //   - cfg.flags: { preview, dryRun, logProgress, stopOnError }
 //   - cfg.general: { limit, defaultTimeoutMs, apigwSoftTimeoutMs, safeRemainingMs, concurrency, batchSize, iniciouEm }
-//   - cfg.direct: { useDirect, endpointUrl, batchSize }
+//   - cfg.direct: { useDirect, endpointUrl, batchSize, batchSizeSugerido }
 //   - cfg.ids: { uploadId, fileHash }
 //   - cfg.integration: { endpoint, integrationUrl, authorization }
 //   - cfg.error: caso falte algo essencial, padroniza { status, msg }
@@ -57,10 +57,20 @@ function buildConfigFromEvent(event, context) {
   };
 
   // Direto:
+  // Regra solicitada: se x-batch-size vier 0, null/undefined ou não enviado → usar 100.
+  // Se vier > 0 e numérico → usar o valor informado.
+  const rawBatch = Number(headers['x-batch-size']);
+  const directBatchSize = (Number.isFinite(rawBatch) && rawBatch > 0) ? rawBatch : 100;
+
+  // Sugerido: somente se numérico > 0; caso contrário 0 (desativado)
+  const rawSuggest = Number(headers['x-suggest-batch-size']);
+  const directSuggest = (Number.isFinite(rawSuggest) && rawSuggest > 0) ? rawSuggest : 0;
+
   const direct = {
     useDirect,
     endpointUrl,
-    batchSize: Math.max(1, num(headers['x-batch-size'], 100)),
+    batchSize: directBatchSize,
+    batchSizeSugerido: directSuggest,
   };
 
   // Identificadores auxiliares:

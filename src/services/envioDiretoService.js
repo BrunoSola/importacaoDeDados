@@ -1,28 +1,36 @@
 // src/services/envioDiretoService.js
 //
 // Envio DIRETO → Flowch com tratamento ADAPTATIVO de duplicatas, sem usar serviços pagos.
-// Regras principais (em português):
-// - x-batch-size: tamanho nominal e estável escolhido pelo cliente (se 0/≤0, usa o padrão do código).
-// - x-suggest-batch-size: tamanho ADAPTATIVO sugerido. 0 = desativado; >0 substitui o nominal temporariamente.
-// - Em erro 400 (duplicatas) ou orçamento de tempo curto, dividimos o lote (metade/metade) até isolar itens:
-//   * Se lote inteiro for duplicado → pulamos todos como duplicados (skippedDuplicates) e avançamos o offset.
-//   * Se for 1 item e continuar falhando → pulamos 1 e avançamos.
-// - Progresso SEMPRE: nextOffset avança por (aceitos + pulados). Se não houve progresso → devolvemos 206 com
-//   nextOffset igual ao offsetInicial e x-suggest-batch-size com uma sugestão menor (metade do efetivo).
-// - Quando um lote passa “limpo” (sem subdivisão), devolvemos x-suggest-batch-size = 0 (volta a usar o nominal).
+// Ideia central (resumo):
+// - x-batch-size: tamanho nominal e estável escolhido por você (se for 0/ausente → usamos padrão).
+// - x-suggest-batch-size: tamanho ADAPTATIVO temporário. 0 = desativado; >0 substitui o nominal.
+// - Se a API devolver lote totalmente duplicado, pulamos o lote todo (sem reenvio). Se for 1 item e
+//   ainda falhar, pulamos 1 e avançamos (evita loop infinito).
+// - O nextOffset SEMPRE avança por (aceitos + pulados). Se não houve avanço, devolvemos 206 mantendo
+//   o offset e sugerindo reduzir o batch (metade do efetivo).
+// - Quando um lote passa “limpo” (sem divisão adaptativa), zeramos a sugestão (volta ao nominal).
 //
-// Observação:
-// - Mantém API/shape da resposta; apenas adiciona cabeçalhos e campos em summary para melhor telemetria.
-// - SINGLE_BATCH_MODE='1' (padrão): 1 lote por invocação — seguro para janela ~29s do API Gateway.
+// Logs:
+// - LOG_RESP=1 → loga status/content-type/tamanho + preview do body (1KB) do(s) retorno(s).
+// - DIRECT_DEBUG=1 → logs de fluxo (decisões, offsets, etc.).
+//
+// SINGLE_BATCH_MODE='1' (padrão): 1 lote por invocação — seguro para janela ~29s do API Gateway.
 
 const { sendBatchesDirectToFlowch } = require('../utils/flowchDirectSender');
 const { respostaJson } = require('../utils/httpResponse');
 
+// ---------- Parâmetros de execução (com padrões seguros) ----------
 const LAMBDA_TIMEOUT_MS = 25000;
 const SINGLE_BATCH_MODE = String(process.env.SINGLE_BATCH_MODE ?? '1') === '1';
 const ACCEPT_MODE = String(process.env.ACCEPT_MODE || 'optimistic').toLowerCase();
 const RETRY_AFTER_SECS = Math.max(0, Number(process.env.RETRY_AFTER_SECS || 1));
 
+// ---------- Toggles de log ----------
+const LOG_RESP = String(process.env.LOG_RESP || '0') === '1';
+const DIRECT_DEBUG = String(process.env.DIRECT_DEBUG || '0') === '1';
+const dbg = (...args) => { if (DIRECT_DEBUG) console.log('[direct]', ...args); };
+
+// ---------- Utilidades de conversão e parse ----------
 /** Converte para número com fallback 0 */
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 
@@ -30,6 +38,7 @@ const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 const safeParseIfJson = (maybeJson) => {
   if (typeof maybeJson !== 'string') return (maybeJson || {});
   const s = maybeJson.trim();
+  if (!s) return {};
   const c = s.charCodeAt(0); // 123:'{', 91:'['
   if (c !== 123 && c !== 91) return {};
   try { return JSON.parse(s); } catch { return {}; }
@@ -38,16 +47,22 @@ const safeParseIfJson = (maybeJson) => {
 const getStatus = (r) => Number(r?.statusCode ?? r?.status ?? r?.code ?? 0);
 const isOk      = (r) => { const sc = getStatus(r); return sc >= 200 && sc < 300; };
 
-/** Política de erro por item (telemetria) */
+/** Política de contagem de erro por item (telemetria) */
 const isCountedAsError = (r) => {
   if (ACCEPT_MODE === 'optimistic') {
     const sc = getStatus(r);
+    // só conta erros "grosseiros" (ex.: 599/sem status)
     return !sc || sc === 599;
   }
+  // strict: qualquer não-2xx
   return !isOk(r);
 };
 
-/** Extrai contadores de alteração e sinais de duplicata do corpo da resposta */
+// ---------- Extração de contadores da resposta ----------
+/**
+ * Lê counters típicos (recordsInserted/Updated/Deleted) e tenta inferir duplicatas
+ * a partir de campos comuns e/ou lista de erros.
+ */
 function extractCounts(bodyRaw) {
   const body = safeParseIfJson(bodyRaw);
 
@@ -62,7 +77,7 @@ function extractCounts(bodyRaw) {
   const updated = num(body.recordsUpdated);
   const deleted = num(body.recordsDeleted);
 
-  // Heurísticas de duplicata: somamos indicadores diretos e erros ALREADY_EXISTS
+  // Heurística de duplicatas
   let alreadyExists = 0;
   const sumLike = (...vals) => vals.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
 
@@ -88,15 +103,21 @@ function extractCounts(bodyRaw) {
   return { inserted, updated, deleted, alreadyExists, body };
 }
 
-/** Retorna true quando TODO o lote é duplicado (mudanças=0 e dups == enviados) */
+/**
+ * Determina se TODO o lote foi duplicado (sem mudanças e dups == enviados).
+ * Aceita status 400 (erro de validação) e também 200 com counters indicando 0 mudanças e N duplicatas.
+ */
 function isWholeBatchDuplicate({ sent, counts, statusCode }) {
   const totalChanges = counts.inserted + counts.updated + counts.deleted;
   if (totalChanges > 0) return false;
-  if (statusCode === 400 && counts.alreadyExists >= sent && sent > 0) return true;
-  return (counts.alreadyExists >= sent && sent > 0);
+  if (sent <= 0) return false;
+  // Se vier 400 e todos já existem → lote inteiro duplicado
+  if (statusCode === 400 && counts.alreadyExists >= sent) return true;
+  // Mesmo raciocínio com 200 (alguns endpoints devolvem 200 com erros no corpo)
+  return (counts.alreadyExists >= sent);
 }
 
-/** Monta o resumo da execução (sem re-varrer estruturas) */
+// ---------- Montagem de resumo para a resposta ----------
 function buildSummary({
   endpointUrl,
   totalLinhas,
@@ -129,10 +150,10 @@ function buildSummary({
     dryRun: false,
     preview: !!previewAtivo,
 
-    // Informações de batch
-    batchSize: batchNominal,                 // nominal do cliente (x-batch-size)
-    suggestBatchSize: batchSugerido,         // valor recebido em x-suggest-batch-size
-    effectiveBatchSize: tamanhoLoteEfetivo,  // usado nesta execução (sugerido>0 ? sugerido : nominal)
+    // Telemetria de batch
+    batchSize: batchNominal,                 // nominal (x-batch-size)
+    suggestBatchSize: batchSugerido,         // sugerido recebido
+    effectiveBatchSize: tamanhoLoteEfetivo,  // efetivo usado (sugerido>0 ? sugerido : nominal)
     totalBatches,
 
     uploadId,
@@ -141,11 +162,11 @@ function buildSummary({
     recordsInserted: totais.recordsInserted,
     recordsUpdated:  totais.recordsUpdated,
     recordsDeleted:  totais.recordsDeleted,
-    skippedDuplicates,                       // quantos itens foram pulados por duplicata
+    skippedDuplicates,                       // total de itens pulados por duplicata
   };
 }
 
-/** Calcula orçamento/timeout efetivo para a tentativa atual (seguro para janela do APIGW) */
+// ---------- Cálculo de orçamento/timeout seguro por chamada ----------
 function calcEffectiveTimeout({ iniciouEm, apigwSoftTimeoutMs, margemSegurancaMs, timeoutMs }) {
   const gwLimitMs = Number.isFinite(apigwSoftTimeoutMs) ? apigwSoftTimeoutMs : 29000;
   const msSafe    = Number.isFinite(margemSegurancaMs) ? margemSegurancaMs : Number(process.env.SAFE_REMAINING_MS || 4000);
@@ -160,12 +181,13 @@ function calcEffectiveTimeout({ iniciouEm, apigwSoftTimeoutMs, margemSegurancaMs
   return { effectiveTimeoutMs, budget };
 }
 
+// ---------- Envio de um lote com “consciência de duplicata” (divide & conquista) ----------
 /**
- * Envia um lote com “consciência de duplicata” (divide&conquista).
- * - Se todo o lote for duplicado: pulamos todos (skippedDuplicates = sent).
- * - Se 1 item falhar: pulamos 1 (garante progresso).
- * - Se houver mudanças confirmadas (insert/update/delete): aceitamos.
- * Retorna métricas do envio e se houve uso de split adaptativo.
+ * Estratégia:
+ * 1) Tenta enviar a fatia inteira. Se vier mudanças confirmadas → sucesso.
+ * 2) Se a API indicar “lote todo duplicado” → pula tudo (skippedDuplicates = sent).
+ * 3) Se só há 1 item e falhar → pula 1 (garante progresso e evita loop).
+ * 4) Caso contrário, divide em 2 e tenta recursivamente (adaptação).
  */
 async function sendDuplicateAware({
   records, startIndex,
@@ -174,13 +196,24 @@ async function sendDuplicateAware({
 }) {
   const sent = records.length;
   if (sent === 0) {
-    return { accepted: 0, inserted: 0, updated: 0, deleted: 0, skippedDuplicates: 0, errosBatchesCountDelta: 0, batchesUsed: 0, budgetLeft: null, usedAdaptiveSplit: false };
+    return {
+      accepted: 0, inserted: 0, updated: 0, deleted: 0,
+      skippedDuplicates: 0, errosBatchesCountDelta: 0, batchesUsed: 0,
+      budgetLeft: null, usedAdaptiveSplit: false
+    };
   }
 
   const { effectiveTimeoutMs, budget } = calcEffectiveTimeout({ iniciouEm, apigwSoftTimeoutMs, margemSegurancaMs, timeoutMs });
   if (budget <= 0) {
-    return { accepted: 0, inserted: 0, updated: 0, deleted: 0, skippedDuplicates: 0, errosBatchesCountDelta: 0, batchesUsed: 0, budgetLeft: budget, usedAdaptiveSplit: true };
+    // sem orçamento → peça para reentrar com 206 mantendo offset
+    return {
+      accepted: 0, inserted: 0, updated: 0, deleted: 0,
+      skippedDuplicates: 0, errosBatchesCountDelta: 0, batchesUsed: 0,
+      budgetLeft: budget, usedAdaptiveSplit: true
+    };
   }
+
+  dbg('try', { startIndex, sent, batchSizeEfetivo, effectiveTimeoutMs });
 
   const aggregated = await sendBatchesDirectToFlowch({
     endpointUrl,
@@ -191,10 +224,35 @@ async function sendDuplicateAware({
     method: 'POST',
   });
 
+  // Logs detalhados do retorno (limitados)
+  if (LOG_RESP && aggregated?.results?.length) {
+    aggregated.results.slice(0, 3).forEach((r, idx) => {
+      const bodyStr = typeof r.body === 'string' ? r.body : JSON.stringify(r.body || {});
+      console.log('[HTTP-RESP]', {
+        label: 'fast-path',
+        batchIndex: idx + 1,
+        status: r?.statusCode ?? r?.status ?? null,
+        contentType: r?.headers?.['content-type'] || r?.headers?.['Content-Type'] || null,
+        bodyLen: bodyStr.length,
+        bodyPreview: bodyStr.slice(0, 1024),
+      });
+    });
+  }
+  dbg('resp', {
+    resultsCount: aggregated?.results?.length || 0,
+    firstStatus: aggregated?.results?.[0]?.statusCode ?? null
+  });
+
   if (!aggregated?.results || aggregated.results.length === 0) {
-    return { accepted: 0, inserted: 0, updated: 0, deleted: 0, skippedDuplicates: 0, errosBatchesCountDelta: 0, batchesUsed: 1, budgetLeft: budget, usedAdaptiveSplit: true };
+    // sem resposta significativa → trate como parcela consumida do orçamento e peça reentrada
+    return {
+      accepted: 0, inserted: 0, updated: 0, deleted: 0,
+      skippedDuplicates: 0, errosBatchesCountDelta: 0, batchesUsed: 1,
+      budgetLeft: budget, usedAdaptiveSplit: true
+    };
   }
 
+  // Soma counters dos itens da resposta
   let inserted = 0, updated = 0, deleted = 0;
   let skippedDuplicates = 0;
   let errosBatchesCountDelta = 0;
@@ -213,6 +271,7 @@ async function sendDuplicateAware({
 
   // Caso feliz: houve mudanças confirmadas
   if (anyOk && (inserted + updated + deleted) > 0) {
+    dbg('decision', { kind: 'accepted', changes: inserted + updated + deleted });
     return {
       accepted: inserted + updated + deleted,
       inserted, updated, deleted,
@@ -225,7 +284,8 @@ async function sendDuplicateAware({
   }
 
   // Lote inteiro duplicado → pula tudo (progresso garantido)
-  if (firstStatus === 400 && isWholeBatchDuplicate({ sent, counts: mergedCounts, statusCode: 400 })) {
+  if (isWholeBatchDuplicate({ sent, counts: mergedCounts, statusCode: firstStatus })) {
+    dbg('decision', { kind: 'skip-whole-batch', sent, status: firstStatus });
     return {
       accepted: 0,
       inserted: 0, updated: 0, deleted: 0,
@@ -239,6 +299,7 @@ async function sendDuplicateAware({
 
   // 1 item e falhou → pular 1 (evita loop)
   if (sent === 1) {
+    dbg('decision', { kind: 'skip-one' });
     return {
       accepted: 0,
       inserted: 0, updated: 0, deleted: 0,
@@ -250,7 +311,7 @@ async function sendDuplicateAware({
     };
   }
 
-  // Divide&Conquista
+  // Divide & conquista
   const mid = Math.floor(sent / 2);
   const left  = records.slice(0, mid);
   const right = records.slice(mid);
@@ -280,7 +341,7 @@ async function sendDuplicateAware({
   };
 }
 
-// --------- Função principal: aplica política de batch nominal vs sugerido ---------
+// ---------- Função principal: aplica política nominal vs sugerido e responde ----------
 async function executarEnvioDireto({
   registros,
   offsetInicial,
@@ -303,7 +364,7 @@ async function executarEnvioDireto({
   etaMultiplier,
   etaMinMs,
 }) {
-  // Padrão interno do serviço: se x-batch-size ≤ 0, usamos BATCH_SIZE/env ou 20.
+  // Se x-batch-size ≤ 0, usamos BATCH_SIZE/env ou 20.
   const defaultNominal = Math.max(1, Number(process.env.BATCH_SIZE || 20));
 
   const batchNominal =
@@ -316,7 +377,7 @@ async function executarEnvioDireto({
   // Efetivo = sugerido (se ativo), senão nominal
   const batchEfetivo = batchSugerido > 0 ? batchSugerido : batchNominal;
 
-  // DRY-RUN: não envia nada; útil para validar cabeçalhos
+  // DRY-RUN: apenas devolve o esqueleto (útil para validar headers/caminho)
   if (dryRun) {
     const summary = {
       modo: 'direto-flowch',
@@ -339,7 +400,12 @@ async function executarEnvioDireto({
       recordsDeleted: 0,
       skippedDuplicates: 0,
     };
-    return respostaJson(200, { nextOffset: offsetInicial, suggestBatchSize: batchSugerido, done: true, summary });
+    return respostaJson(200, {
+      nextOffset: offsetInicial,
+      suggestBatchSize: batchSugerido,
+      done: true,
+      summary
+    });
   }
 
   const todos = Array.isArray(registros) ? registros : [];
@@ -354,7 +420,7 @@ async function executarEnvioDireto({
   let skippedDuplicates = 0;
 
   while (indice < todos.length) {
-    // Fatia conforme batch EFETIVO (sugerido>0 ? sugerido : nominal)
+    // Fatia conforme batch EFETIVO
     const fim   = Math.min(indice + batchEfetivo, todos.length);
     const fatia = todos.slice(indice, fim);
     if (fatia.length === 0) break;
@@ -379,13 +445,20 @@ async function executarEnvioDireto({
     aceitosTotais += progressoFatia;
     indiceAceito   = (offsetInicial || 0) + aceitosTotais;
 
-    // nextOffset de saída: se não houve progresso, mantém o offsetInicial (evita “pular” pendentes)
+    // nextOffset de saída: se não houve progresso, mantém o offsetInicial
     const nextOffsetOut = (progressoFatia > 0) ? indiceAceito : (offsetInicial || 0);
 
-    // Avança cursor interno (não afeta próxima invocação — ela lê nextOffsetOut do body)
-    indice = SINGLE_BATCH_MODE ? fim : Math.max(indiceAceito, indice);
-
+    // Avança cursor interno desta invocação
     const temMais = fim < todos.length;
+    dbg('loop', {
+      indiceInicial: indice,
+      fatia: fatia.length,
+      progressoFatia,
+      indiceAceito,
+      nextOffsetOut,
+      batchEfetivo
+    });
+    indice = SINGLE_BATCH_MODE ? fim : Math.max(indiceAceito, indice);
 
     // Monta resumo
     const summary = buildSummary({
@@ -406,16 +479,15 @@ async function executarEnvioDireto({
       batchSugerido,
     });
 
-    // Política para x-suggest-batch-size de retorno:
-    // - Sem progresso → sugerimos metade do efetivo (próxima chamada menor).
-    // - Com progresso E houve split interno → manter sugestão ativa (continua pequeno).
-    // - Com progresso E sem split → reset para 0 (encerrou bloco problemático).
+    // Política para x-suggest-batch-size de retorno
     let nextSuggest = batchSugerido; // default: manter como veio
     if (progressoFatia === 0) {
-      nextSuggest = Math.max(1, Math.floor(batchEfetivo / 2));
+      nextSuggest = Math.max(1, Math.floor(batchEfetivo / 2)); // reduzir
     } else if (res.usedAdaptiveSplit) {
+      // houve split interno → continuar pequeno por mais uma rodada
       nextSuggest = (batchSugerido > 0) ? batchSugerido : batchEfetivo;
     } else {
+      // passou “limpo” → resetar sugestão
       nextSuggest = 0;
     }
 
@@ -426,7 +498,7 @@ async function executarEnvioDireto({
       'x-suggest-batch-size': String(nextSuggest),
     };
 
-    // SINGLE_BATCH_MODE (recomendado): 1 lote por invocação
+    // SINGLE_BATCH_MODE: responde e encerra (1 lote por invocação)
     if (SINGLE_BATCH_MODE) {
       if (temMais) {
         return {
@@ -437,7 +509,7 @@ async function executarEnvioDireto({
             suggestBatchSize: nextSuggest,
             done: false,
             summary,
-            hints: { suggestNextBatchSize: nextSuggest }, // redundância útil no body
+            hints: { suggestNextBatchSize: nextSuggest },
           }),
         };
       }
@@ -445,7 +517,13 @@ async function executarEnvioDireto({
       return {
         statusCode: 200,
         headers: baseHeaders,
-        body: JSON.stringify({ nextOffset: null, suggestBatchSize: 0, done: true, summary, hints: { suggestNextBatchSize: 0 }, }),
+        body: JSON.stringify({
+          nextOffset: null,
+          suggestBatchSize: 0,
+          done: true,
+          summary,
+          hints: { suggestNextBatchSize: 0 },
+        }),
       };
     }
 
@@ -491,7 +569,13 @@ async function executarEnvioDireto({
       'x-batch-size': String(batchNominal),
       'x-suggest-batch-size': '0', // final “limpo”: volta ao nominal
     },
-    body: JSON.stringify({ nextOffset: null,suggestBatchSize: 0, done: true, summary, hints: { suggestNextBatchSize: 0 }, }),
+    body: JSON.stringify({
+      nextOffset: null,
+      suggestBatchSize: 0,
+      done: true,
+      summary,
+      hints: { suggestNextBatchSize: 0 },
+    }),
   };
 }
 

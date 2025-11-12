@@ -1,39 +1,70 @@
 // src/importers/xlsxImporter.js
+// Importador de XLSX com foco em baixo uso de memória/CPU na Lambda.
+// Mantém o contrato atual (exporta { tipo, carregar, carregarPlanilhaXlsx }) e
+// adiciona leitura por FAIXA (carregarFaixa) usando streaming quando possível.
+
 const ExcelJS = require('exceljs');
 const { Readable } = require('stream');
 const LIMITES = require('./limites');
 
-function toCell(v) {
-  if (v == null) return '';
-  if (v instanceof Date) return v.toISOString();
-  if (typeof v === 'object') {
-    if ('result' in v && v.result != null) return toCell(v.result);
-    if ('text'   in v && v.text   != null) return String(v.text).trim();
-    if ('hyperlink' in v) return v.text != null ? String(v.text).trim() : String(v.hyperlink).trim();
+/* ========================================================================
+ * Conversão de célula → valor serializável
+ * - Objetivo: padronizar saídas e evitar objetos internos do ExcelJS no JSON.
+ * - Mantém compatibilidade retornando strings (como seu importador atual faz).
+ * ======================================================================== */
+function toCell(cellRawValue) {
+  if (cellRawValue == null) return '';
+  if (cellRawValue instanceof Date) return cellRawValue.toISOString();
+
+  if (typeof cellRawValue === 'object') {
+    if ('result' in cellRawValue && cellRawValue.result != null) return toCell(cellRawValue.result);
+    if ('text' in cellRawValue && cellRawValue.text != null) return String(cellRawValue.text).trim();
+    if ('hyperlink' in cellRawValue) {
+      return cellRawValue.text != null ? String(cellRawValue.text).trim() : String(cellRawValue.hyperlink).trim();
+    }
+    if (Array.isArray(cellRawValue.richText)) {
+      return cellRawValue.richText.map(p => p.text || '').join('').trim();
+    }
   }
-  return String(v).trim();
+
+  return String(cellRawValue).trim();
 }
 
+/* ========================================================================
+ * Linha vazia?
+ * - Objetivo: pular “linhas zumbis” (formatadas, porém sem dados).
+ * - maxCols limita o scan por segurança (colunas demais = custo desnecessário).
+ * ======================================================================== */
 function rowIsEmpty(row, maxCols) {
-  const n = Math.max(1, Math.min(Number(row?.cellCount || maxCols) || maxCols, maxCols));
-  for (let c = 1; c <= n; c++) {
+  const totalColsToCheck = Math.max(1, Math.min(Number(row?.cellCount || maxCols) || maxCols, maxCols));
+  for (let c = 1; c <= totalColsToCheck; c++) {
     const val = toCell(row.getCell(c)?.value);
     if (val !== '') return false;
   }
   return true;
 }
 
+/* ========================================================================
+ * Cabeçalho a partir da primeira linha não-vazia
+ * - Objetivo: manter seu padrão de “primeira linha com dados = header”.
+ * - Garante nomes válidos, preenchendo “col_1”, “col_2”, ... se vazio.
+ * ======================================================================== */
 function buildHeadersFromRow(row, maxCols) {
-  const n = Math.max(1, Math.min(Number(row?.cellCount || maxCols) || maxCols, maxCols));
+  const totalCols = Math.max(1, Math.min(Number(row?.cellCount || maxCols) || maxCols, maxCols));
   const headers = [];
-  for (let c = 1; c <= n; c++) {
-    const val = String(toCell(row.getCell(c)?.value) || '').trim();
-    headers.push(val || `col_${c}`);
+  for (let c = 1; c <= totalCols; c++) {
+    const headerName = String(toCell(row.getCell(c)?.value) || '').trim();
+    headers.push(headerName || `col_${c}`);
   }
   return headers;
 }
 
-// ========== STREAMING ==========
+/* ========================================================================
+ * Leitura via STREAMING (preferencial)
+ * - Objetivo: reduzir picos de memória (não materializa a planilha inteira).
+ * - Para imediatamente ao atingir LIMITES.MAX_ROWS (ou limitarLinhas).
+ * - Processa apenas a primeira worksheet (padrão do projeto) ou a desejada.
+ * ======================================================================== */
 async function carregarStream(contexto = {}) {
   const {
     buffer,
@@ -47,7 +78,7 @@ async function carregarStream(contexto = {}) {
   const maxRows = Number(limitarLinhas) > 0 ? Number(limitarLinhas) : LIMITES.MAX_ROWS;
   const maxCols = Math.max(1, Math.min(Number(limitarColunas) || LIMITES.MAX_COLS, LIMITES.MAX_COLS));
 
-  const linhas = [];
+  const outputRows = [];
   const source = Readable.from(buffer);
 
   const reader = new ExcelJS.stream.xlsx.WorkbookReader(source, {
@@ -58,50 +89,58 @@ async function carregarStream(contexto = {}) {
     worksheets: 'emit',
   });
 
-  let sheetIdx = 0;
-  let header = null; // só define quando achar a primeira linha NÃO vazia
+  let currentSheetIndex = 0;
+  let header = null;
 
-  for await (const ws of reader) {
-    if (ws.type !== 'worksheet') continue;
-    sheetIdx += 1;
-    if (sheetIdx !== planilhaIndice) { await ws.skip(); continue; }
+  for await (const worksheet of reader) {
+    if (worksheet.type !== 'worksheet') continue;
+    currentSheetIndex += 1;
 
-    for await (const row of ws) {
-      // pula linhas totalmente vazias até achar cabeçalho
+    if (currentSheetIndex !== planilhaIndice) {
+      await worksheet.skip();
+      continue;
+    }
+
+    for await (const row of worksheet) {
+      // Descobrir cabeçalho
       if (!header) {
         if (rowIsEmpty(row, maxCols)) continue;
         header = buildHeadersFromRow(row, maxCols);
         continue;
       }
 
-      const cCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
-      const rec = {};
+      // Linhas de dados
+      const cellCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
+      const record = {};
       let hasValue = false;
 
-      for (let c = 1; c <= cCount; c++) {
-        const head = header[c - 1] || `col_${c}`;
+      for (let c = 1; c <= cellCount; c++) {
+        const key = header[c - 1] || `col_${c}`;
         const val = toCell(row.getCell(c)?.value);
         if (val !== '') hasValue = true;
-        rec[head] = val;
+        record[key] = val;
       }
 
-      // evita empurrar linha completamente vazia
       if (hasValue) {
-        linhas.push(rec);
-        if (linhas.length >= maxRows) {
-          if (typeof ws.abort === 'function') try { ws.abort(); } catch {}
+        outputRows.push(record);
+        if (outputRows.length >= maxRows) {
+          if (typeof worksheet.abort === 'function') try { worksheet.abort(); } catch {}
           if (typeof reader.abort === 'function') try { reader.abort(); } catch {}
           break;
         }
       }
     }
-    break; // processa só a planilha desejada
+    break; // só a planilha alvo
   }
 
-  return linhas;
+  return outputRows;
 }
 
-// ========== FALLBACK IN-MEMORY ==========
+/* ========================================================================
+ * Fallback in-memory (Workbook completo)
+ * - Objetivo: compatibilidade para cenários onde o streaming não atende.
+ * - Ainda respeita LIMITES.MAX_ROWS e LIMITES.MAX_COLS.
+ * ======================================================================== */
 async function carregarFallback(contexto = {}) {
   const {
     buffer,
@@ -115,188 +154,171 @@ async function carregarFallback(contexto = {}) {
   const maxRows = Number(limitarLinhas) > 0 ? Number(limitarLinhas) : LIMITES.MAX_ROWS;
   const maxCols = Math.max(1, Math.min(Number(limitarColunas) || LIMITES.MAX_COLS, LIMITES.MAX_COLS));
 
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buffer);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
 
-  const sheet = wb.worksheets[(planilhaIndice - 1)] || wb.worksheets[0];
+  const sheet = workbook.worksheets[(planilhaIndice - 1)] || workbook.worksheets[0];
   if (!sheet) return [];
 
-  // encontra a primeira linha não vazia como cabeçalho
-  let headerRowIdx = 1;
-  while (headerRowIdx <= (sheet.actualRowCount || sheet.rowCount || 1)) {
-    const candidate = sheet.getRow(headerRowIdx);
+  // Achar a primeira linha não-vazia para virar cabeçalho
+  let headerRowIndex = 1;
+  const lastRowIndex = sheet.actualRowCount || sheet.rowCount || 1;
+
+  while (headerRowIndex <= lastRowIndex) {
+    const candidate = sheet.getRow(headerRowIndex);
     if (!rowIsEmpty(candidate, maxCols)) break;
-    headerRowIdx++;
+    headerRowIndex++;
   }
 
-  const headerRow = sheet.getRow(headerRowIdx);
+  const headerRow = sheet.getRow(headerRowIndex);
   const header = buildHeadersFromRow(headerRow, maxCols);
 
-  const linhas = [];
-  const lastRow = sheet.actualRowCount || sheet.rowCount || headerRowIdx;
+  const outputRows = [];
+  const dataLastIndex = sheet.actualRowCount || sheet.rowCount || headerRowIndex;
 
-  for (let r = headerRowIdx + 1; r <= lastRow; r++) {
+  for (let r = headerRowIndex + 1; r <= dataLastIndex; r++) {
     const row = sheet.getRow(r);
-    const cCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
-    const rec = {};
+    const cellCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
+    const record = {};
     let hasValue = false;
 
-    for (let c = 1; c <= cCount; c++) {
-      const head = header[c - 1] || `col_${c}`;
+    for (let c = 1; c <= cellCount; c++) {
+      const key = header[c - 1] || `col_${c}`;
       const val = toCell(row.getCell(c)?.value);
       if (val !== '') hasValue = true;
-      rec[head] = val;
+      record[key] = val;
     }
 
     if (hasValue) {
-      linhas.push(rec);
-      if (linhas.length >= maxRows) break;
+      outputRows.push(record);
+      if (outputRows.length >= maxRows) break;
     }
   }
 
-  return linhas;
+  return outputRows;
 }
 
-// ========== WRAPPER ==========
+/* ========================================================================
+ * Wrapper público: carregarPlanilhaXlsx
+ * - Objetivo: preservar sua assinatura/export atual (usado por outros módulos).
+ * - Estratégia: tenta streaming; se vazio/falhar, cai para fallback.
+ * ======================================================================== */
 async function carregarPlanilhaXlsx(contexto = {}) {
   try {
-    const viaStream = await carregarStream(contexto);
-    if (viaStream && viaStream.length) return viaStream;
-    // se streaming não trouxe linhas, tenta fallback
+    const viaStreaming = await carregarStream(contexto);
+    if (viaStreaming && viaStreaming.length) return viaStreaming;
     return await carregarFallback(contexto);
   } catch {
-    // se streaming falhar, tenta fallback
     return await carregarFallback(contexto);
   }
 }
 
-module.exports = {
-  tipo: 'xlsx',
-  carregar: carregarPlanilhaXlsx,    // wrapper (streaming + fallback)
-  carregarPlanilhaXlsx,
-  _stream: carregarStream,           // opcional: útil pra debug
-  _fallback: carregarFallback,       // opcional
-};
+/* ========================================================================
+ * NOVO: Leitura por FAIXA (offset/limit) — ideal p/ x-offset/x-batch-size
+ * - Objetivo: montar só a janela a ser enviada agora (economia de CPU/memória).
+ * - Implementação: streaming preferencial; fallback fatia do resultado completo.
+ * - offset é 0-based sobre as LINHAS DE DADOS (após o cabeçalho).
+ * ======================================================================== */
+async function carregarFaixa(contexto = {}) {
+  const {
+    buffer,
+    offset = 0,
+    limit = 0,
+    limitarColunas = LIMITES.MAX_COLS,
+    planilhaIndice = 1,
+  } = contexto;
 
+  if (!buffer || !buffer.length) return [];
 
+  const safeOffset = Math.max(0, Number(offset || 0));
+  const safeLimit = Math.max(0, Number(limit || 0));
+  const wantsLimit = safeLimit > 0;
+  const maxCols = Math.max(1, Math.min(Number(limitarColunas) || LIMITES.MAX_COLS, LIMITES.MAX_COLS));
 
-
-
-/*const ExcelJS = require('exceljs');
-const LIMITES = require('./limites');
-
-function valorPrimarioDaCelula(v) {
-  if (v == null) return '';
-  if (v instanceof Date) return v.toISOString();
-
-  if (typeof v === 'object') {
-    if (Object.prototype.hasOwnProperty.call(v, 'result') && v.result != null) {
-      return valorPrimarioDaCelula(v.result);
-    }
-    if (Object.prototype.hasOwnProperty.call(v, 'text') && v.text != null) {
-      return String(v.text).trim();
-    }
-    if (Object.prototype.hasOwnProperty.call(v, 'hyperlink')) {
-      if (v.text != null) return String(v.text).trim();
-      if (v.hyperlink != null) return String(v.hyperlink).trim();
-      return '';
-    }
-    if (Array.isArray(v.richText)) {
-      return v.richText.map(p => p.text || '').join('').trim();
-    }
-    if (v instanceof Date) return v.toISOString();
-    return '';
-  }
-
-  if (typeof v === 'string') return v.trim();
-  if (typeof v === 'number' || typeof v === 'boolean') return v;
-  return String(v).trim();
-}
-
-function extrairCabecalho(planilha) {
-  const linhaCabecalho = planilha.getRow(1);
-  const cabecalho = [];
-  linhaCabecalho.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-    if (colNumber > LIMITES.MAX_COLS) return;
-    cabecalho.push(valorPrimarioDaCelula(cell.value));
-  });
-
-  while (cabecalho.length && (cabecalho[cabecalho.length - 1] === '' || cabecalho[cabecalho.length - 1] == null)) {
-    cabecalho.pop();
-  }
-
-  if (!cabecalho.length) {
-    const e = new Error('Cabeçalho ausente.');
-    e.statusCode = 400; throw e;
-  }
-  if (cabecalho.some(h => !h || String(h).trim() === '')) {
-    const e = new Error('Cabeçalho inválido: há coluna sem nome.');
-    e.statusCode = 400; throw e;
-  }
-  const set = new Set(cabecalho);
-  if (set.size !== cabecalho.length) {
-    const e = new Error('Cabeçalho inválido: há colunas duplicadas.');
-    e.statusCode = 400; throw e;
-  }
-  if (cabecalho.length > LIMITES.MAX_COLS) {
-    const e = new Error(`Arquivo com colunas demais (${cabecalho.length} > ${LIMITES.MAX_COLS}).`);
-    e.statusCode = 400; throw e;
-  }
-
-  return cabecalho;
-}
-
-function linhaEstaVazia(planilha, numeroLinha, totalColunas) {
-  for (let c = 1; c <= totalColunas; c++) {
-    const valor = valorPrimarioDaCelula(planilha.getCell(numeroLinha, c).value);
-    if (!(valor === '' || valor == null)) return false;
-  }
-  return true;
-}
-
-async function carregarPlanilhaXlsx({ buffer, limites = LIMITES, dateAsISO = true }) {
-  if (!(buffer && buffer.length >= 2 && buffer[0] === 0x50 && buffer[1] === 0x4B)) {
-    const head = buffer?.slice(0, 8)?.toString('hex') || '';
-    const e = new Error(`Arquivo XLSX inválido (assinatura ZIP ausente). First bytes: ${head}`);
-    e.statusCode = 400;
-    throw e;
-  }
-
-  const workbook = new ExcelJS.Workbook();
+  // --- Streaming preferencial: pula até o offset sem materializar tudo ---
   try {
-    await workbook.xlsx.load(buffer);
-  } catch (err) {
-    const e = new Error(`Falha ao carregar XLSX: ${err.message || 'arquivo inválido'}`);
-    e.statusCode = 400; throw e;
-  }
+    const source = Readable.from(buffer);
+    const reader = new ExcelJS.stream.xlsx.WorkbookReader(source, {
+      entries: 'emit',
+      sharedStrings: 'cache',
+      styles: 'cache',
+      hyperlinks: 'emit',
+      worksheets: 'emit',
+    });
 
-  const planilha = workbook.worksheets[0];
-  if (!planilha) return [];
+    let currentSheetIndex = 0;
+    let header = null;
+    let produced = 0;
+    let skippedDataRows = 0;
+    const windowRows = [];
 
-  const cabecalho = extrairCabecalho(planilha);
-  const linhas = [];
-  const ultimaLinha = Math.min(planilha.rowCount, limites.MAX_ROWS + 1);
-
-  for (let linha = 2; linha <= ultimaLinha; linha++) {
-    if (linhaEstaVazia(planilha, linha, cabecalho.length)) continue;
-
-    const registro = {};
-    for (let col = 1; col <= cabecalho.length; col++) {
-      let valor = planilha.getCell(linha, col).value;
-      let primario = valorPrimarioDaCelula(valor);
-      if (!dateAsISO && valor instanceof Date) {
-        primario = valor;
+    for await (const worksheet of reader) {
+      if (worksheet.type !== 'worksheet') continue;
+      currentSheetIndex += 1;
+      if (currentSheetIndex !== planilhaIndice) {
+        await worksheet.skip();
+        continue;
       }
-      registro[cabecalho[col - 1]] = primario;
-    }
-    linhas.push(registro);
-  }
 
-  return linhas;
+      for await (const row of worksheet) {
+        // Detectar cabeçalho
+        if (!header) {
+          if (rowIsEmpty(row, maxCols)) continue;
+          header = buildHeadersFromRow(row, maxCols);
+          continue;
+        }
+
+        // Pular até o início da janela
+        if (skippedDataRows < safeOffset) {
+          if (!rowIsEmpty(row, maxCols)) skippedDataRows++;
+          continue;
+        }
+
+        // Coletar dentro da janela
+        const cellCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
+        const record = {};
+        let hasValue = false;
+
+        for (let c = 1; c <= cellCount; c++) {
+          const key = header[c - 1] || `col_${c}`;
+          const val = toCell(row.getCell(c)?.value);
+          if (val !== '') hasValue = true;
+          record[key] = val;
+        }
+
+        if (hasValue) {
+          windowRows.push(record);
+          produced++;
+          if (wantsLimit && produced >= safeLimit) {
+            if (typeof worksheet.abort === 'function') try { worksheet.abort(); } catch {}
+            if (typeof reader.abort === 'function') try { reader.abort(); } catch {}
+            break;
+          }
+        }
+      }
+
+      break; // processa apenas a planilha alvo
+    }
+
+    return windowRows;
+  } catch {
+    // --- Fallback universal: lê tudo e fatia (correto, porém mais custoso) ---
+    const all = await carregarPlanilhaXlsx({ buffer, limitarColunas, planilhaIndice });
+    const endIndex = wantsLimit ? safeOffset + safeLimit : all.length;
+    return all.slice(safeOffset, endIndex);
+  }
 }
 
+/* ========================================================================
+ * Exports estáveis (compat) + novas capacidades
+ * - Não afeta quem já faz require('xlsxImporter').carregar(...)
+ * - Adiciona carregarFaixa para uso via fileParser.parseFileToObjectsRange(...)
+ * ======================================================================== */
 module.exports = {
   tipo: 'xlsx',
-  carregar: carregarPlanilhaXlsx,
-  carregarPlanilhaXlsx,
-};*/
+  carregar: carregarPlanilhaXlsx,  // mantém contrato atual
+  carregarPlanilhaXlsx,            // alias explícito
+  carregarFaixa,                   // NOVO: leitura por janela
+  _stream: carregarStream,         // opcional (debug)
+  _fallback: carregarFallback,     // opcional (debug)
+};
