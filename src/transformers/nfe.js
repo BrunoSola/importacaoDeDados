@@ -100,7 +100,7 @@ function mapearPai(parsed) {
   out.ambiente = prot?.infProt?.tpAmb ?? prot?.tpAmb ?? ide?.tpAmb ?? null;
 
   // Município / UF
-  out.municipio_ibge = ide?.cMunFG ?? null;
+  out.municipio_id = ide?.cMunFG ?? null;
   //out.municipio_id       = null; // será preenchido externamente (resolveMunicipio)
   out.uf = emit?.enderEmit?.UF ?? emit?.enderEmit?.uf ?? null;
 
