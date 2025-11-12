@@ -339,7 +339,7 @@ async function executarEnvioDireto({
       recordsDeleted: 0,
       skippedDuplicates: 0,
     };
-    return respostaJson(200, { nextOffset: offsetInicial, done: true, summary });
+    return respostaJson(200, { nextOffset: offsetInicial, suggestBatchSize: batchSugerido, done: true, summary });
   }
 
   const todos = Array.isArray(registros) ? registros : [];
@@ -434,6 +434,7 @@ async function executarEnvioDireto({
           headers: { ...baseHeaders, 'Retry-After': String(RETRY_AFTER_SECS) },
           body: JSON.stringify({
             nextOffset: nextOffsetOut,
+            suggestBatchSize: nextSuggest,
             done: false,
             summary,
             hints: { suggestNextBatchSize: nextSuggest }, // redundância útil no body
@@ -444,7 +445,7 @@ async function executarEnvioDireto({
       return {
         statusCode: 200,
         headers: baseHeaders,
-        body: JSON.stringify({ nextOffset: null, done: true, summary }),
+        body: JSON.stringify({ nextOffset: null, suggestBatchSize: 0, done: true, summary, hints: { suggestNextBatchSize: 0 }, }),
       };
     }
 
@@ -455,6 +456,7 @@ async function executarEnvioDireto({
         headers: { ...baseHeaders, 'Retry-After': String(RETRY_AFTER_SECS) },
         body: JSON.stringify({
           nextOffset: nextOffsetOut,
+          suggestBatchSize: nextSuggest,
           done: false,
           summary,
           hints: { suggestNextBatchSize: nextSuggest },
@@ -489,7 +491,7 @@ async function executarEnvioDireto({
       'x-batch-size': String(batchNominal),
       'x-suggest-batch-size': '0', // final “limpo”: volta ao nominal
     },
-    body: JSON.stringify({ nextOffset: null, done: true, summary }),
+    body: JSON.stringify({ nextOffset: null,suggestBatchSize: 0, done: true, summary, hints: { suggestNextBatchSize: 0 }, }),
   };
 }
 
