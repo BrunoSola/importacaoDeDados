@@ -76,8 +76,10 @@ async function handler(event, context) {
       registros: t.linhas,
       headersLower: cfg.headers,
       headersRaw: cfg.headersRaw,
-      overrideConsts: String(cfg.headers['x-override-consts'] || '').toLowerCase() === 'true',
+      overrideConsts:
+        String(cfg.headers['x-override-consts'] || '').toLowerCase() === 'true',
       usouTemplate: t.usouTemplate,
+      modoDireto: cfg.direct.useDirect,
     });
 
     // (4) DECISÃO DE MODO → monta plano e executa

@@ -19,7 +19,7 @@
 // - x-template-auto-map: 'true' (default) para mapear colunas com mesmo nome
 
 const { extrairConstantes, aplicarConstantes } = require('../utils/constantes');
-const { limparRegistroPlano } = require('../utils/registros');
+const { limparRegistroPlano, limparRegistroDireto } = require('../utils/registros');
 
 function parseMaybeJson(str) {
   try { return JSON.parse(String(str)); } catch { return null; }
@@ -94,14 +94,25 @@ function applyTemplateIfAny({ linhas, event, headers }) {
 }
 
 /** Aplica CONSTANTES sempre; se usou template, sanitiza (remove campos internos do template) */
-function applyConstantesAndSanitize({ registros, headersLower, headersRaw, overrideConsts, usouTemplate }) {
+function applyConstantesAndSanitize({ registros, headersLower, headersRaw, overrideConsts, usouTemplate, modoDireto }) {
   const consts = extrairConstantes(headersLower, headersRaw);
 
   const aplicados = (Array.isArray(registros) ? registros : [registros]).map((r) =>
     aplicarConstantes(r, consts, overrideConsts)
   );
 
-  const finais = usouTemplate ? aplicados.map(limparRegistroPlano) : aplicados;
+  let finais;
+
+  // ENVIO DIRETO → usa versão sem normalização de tipos
+  if (modoDireto) {
+    finais = aplicados.map(limparRegistroDireto);
+
+  // OUTROS MODOS → usa verão com normalização de tipos
+  } else if (usouTemplate) {
+    finais = aplicados.map(limparRegistroPlano);
+  } else {
+    finais = aplicados;
+  }
 
   return { consts, registrosProcessados: finais };
 }

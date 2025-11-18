@@ -261,7 +261,166 @@ function limparRegistroPlano(registro) {
   return base;
 }
 
+/**
+ * Versão específica para ENVIO DIRETO:
+ * - NÃO faz normalização de tipos (mantém strings como vieram do XLSX/CSV).
+ * - Apenas converte campos *_rel[ID] em __relationships__, removendo-os do root.
+ */
+function montarRelationshipsPorHeadersSemNormalizar(registro) {
+  if (
+    !registro ||
+    typeof registro !== 'object' ||
+    Array.isArray(registro)
+  ) {
+    return { base: registro, relationships: [] };
+  }
+
+  const relRegex = /^(.*)_rel\[(\d+)\]$/;
+  const base = {};
+  const camposRel = [];
+
+  for (const [chave, valor] of Object.entries(registro)) {
+    const m = relRegex.exec(chave);
+    if (m) {
+      const nomeCampo = m[1]; // ex.: cli_emails
+      const idStr = m[2];     // ex.: "10855"
+      camposRel.push({ nomeCampo, idStr, valor });
+    } else {
+      base[chave] = valor;
+    }
+  }
+
+  if (!camposRel.length) {
+    return { base, relationships: [] };
+  }
+
+  const parentGuid =
+    extrairParentGuid(base) || extrairParentGuid(registro);
+
+  const porId = {}; // idStr -> { Id, childrens, records: [] }
+
+  for (const { nomeCampo, idStr, valor } of camposRel) {
+    if (valor === undefined || valor === null || valor === '') continue;
+
+    let valoresArray;
+    if (Array.isArray(valor)) {
+      valoresArray = valor;
+    } else if (typeof valor === 'string') {
+      valoresArray = valor
+        .split('|')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    } else {
+      valoresArray = [valor];
+    }
+
+    if (!valoresArray.length) continue;
+
+    const keyId = String(idStr);
+    if (!porId[keyId]) {
+      const idNum = Number(idStr);
+      porId[keyId] = {
+        Id: Number.isFinite(idNum) ? idNum : idStr,
+        childrens: [],
+        records: [],
+      };
+    }
+
+    const rel = porId[keyId];
+
+    valoresArray.forEach((val, idx) => {
+      if (!rel.records[idx]) rel.records[idx] = {};
+      // 👇 aqui NÃO chamamos normalizarValor, mantemos o tipo original
+      rel.records[idx][nomeCampo] = val;
+    });
+  }
+
+  const relationships = Object.values(porId)
+    .map((rel) => {
+      const records = (rel.records || [])
+        .filter((r) => r && Object.keys(r).length > 0)
+        .map((r) => {
+          const rec = { ...r };
+          if (
+            parentGuid &&
+            (rec.__record_parent_guid__ == null ||
+              rec.__record_parent_guid__ === '')
+          ) {
+            rec.__record_parent_guid__ = parentGuid;
+          }
+          return rec;
+        });
+
+      return {
+        Id: rel.Id,
+        childrens: Array.isArray(rel.childrens) ? rel.childrens : [],
+        records,
+      };
+    })
+    .filter((rel) => rel.records.length > 0);
+
+  return { base, relationships };
+}
+
+/**
+ * Limpeza específica para ENVIO DIRETO:
+ * - Mantém todos os tipos como vieram do template/arquivo (sem normalizar).
+ * - Só converte *_rel[ID] em __relationships__ e mescla com existentes.
+ */
+function limparRegistroDireto(registro) {
+  if (
+    !registro ||
+    typeof registro !== 'object' ||
+    Array.isArray(registro)
+  ) {
+    return registro;
+  }
+
+  const { base, relationships: novos } =
+    montarRelationshipsPorHeadersSemNormalizar(registro);
+
+  if (!novos.length) {
+    return base;
+  }
+
+  const existentes = Array.isArray(base.__relationships__)
+    ? base.__relationships__
+    : [];
+
+  if (!existentes.length) {
+    base.__relationships__ = novos;
+    return base;
+  }
+
+  const byId = new Map();
+
+  const adicionar = (rel) => {
+    if (!rel || typeof rel !== 'object') return;
+    const idKey = String(rel.Id ?? '');
+    if (!byId.has(idKey)) {
+      byId.set(idKey, {
+        Id: rel.Id,
+        childrens: Array.isArray(rel.childrens) ? [...rel.childrens] : [],
+        records: Array.isArray(rel.records) ? [...rel.records] : [],
+      });
+    } else {
+      const acc = byId.get(idKey);
+      if (Array.isArray(rel.childrens)) acc.childrens.push(...rel.childrens);
+      if (Array.isArray(rel.records)) acc.records.push(...rel.records);
+    }
+  };
+
+  existentes.forEach(adicionar);
+  novos.forEach(adicionar);
+
+  base.__relationships__ = Array.from(byId.values());
+
+  return base;
+}
+
+
 module.exports = {
   limparRegistroPlano,
   montarRelationshipsPorHeaders,
+  limparRegistroDireto,
 };
