@@ -261,10 +261,29 @@ async function sendDuplicateAware({
   const anyOk = aggregated.results.some(isOk);
   const firstStatus = getStatus(aggregated.results[0]);
   const mergedCounts = extractCounts(aggregated.results[0]?.body || '{}');
+  const firstBodyStr = typeof aggregated.results[0]?.body === 'string'
+    ? aggregated.results[0].body
+    : JSON.stringify(aggregated.results[0]?.body || {});
+
+  // Falha de URL (ex.: x-endpoint-url invalido): parar cedo em vez de dividir em recursao
+  if (firstStatus === 599 && /invalid url/i.test(firstBodyStr || '')) {
+    return {
+      accepted: 0, inserted: 0, updated: 0, deleted: 0,
+      skippedDuplicates: 0,
+      errosBatchesCountDelta: errosBatchesCountDelta + 1,
+      batchesUsed: 1,
+      budgetLeft: null,
+      usedAdaptiveSplit: false,
+      fatalError: {
+        statusCode: 400,
+        body: JSON.stringify({ error: 'x-endpoint-url invalido ou inacessivel', detalhe: firstBodyStr }),
+        headers: {},
+      },
+    };
+  }
 
   // === Erro fatal de schema (coluna inexistente etc.) ===
   const first = aggregated.results[0];
-  const firstBodyStr = typeof first?.body === 'string' ? first.body : JSON.stringify(first?.body || {});
   const parsed = safeParseIfJson(firstBodyStr);
 
   const e0 = parsed?.errors?.[0]?.erro || {};

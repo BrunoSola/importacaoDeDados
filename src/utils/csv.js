@@ -1,8 +1,8 @@
 // src/utils/csv.js
 // CSV robusto:
-// - Detecta delimitador com heurística e tem FALLBACK baseado no cabeçalho real
+// - Detecta delimitador com heuristica e tem fallback baseado no cabecalho real
 // - Considera candidatos: ; , \t |
-// - Trata BOM e normaliza cabeçalhos (remove BOM, tabs, NBSP, trim)
+// - Trata BOM e normaliza cabecalhos (remove BOM, tabs, NBSP, trim)
 // - RFC4180-like: aspas duplas e escape ""
 
 function stripBOM(text = '') {
@@ -15,9 +15,9 @@ function stripBOM(text = '') {
 function sanitizeHeaderName(h) {
   return String(h || '')
     .replace(/\ufeff/g, '')     // BOM interno
-    .replace(/\u00a0/g, ' ')    // NBSP -> espaço normal
+    .replace(/\u00a0/g, ' ')    // NBSP -> espaco normal
     .replace(/\t/g, '')         // remove tabs perdidos
-    .replace(/\s+/g, ' ')       // colapsa espaços
+    .replace(/\s+/g, ' ')       // colapsa espacos
     .trim();
 }
 
@@ -43,7 +43,7 @@ function splitCsvLine(line, delimiter) {
   return out;
 }
 
-/** Heurística primária de delimitador */
+/** Heuristica primaria de delimitador */
 function detectDelimiter(text) {
   const candidates = [';', ',', '\t', '|'];
   const lines = text.split(/\r?\n/).slice(0, 5).filter(l => l !== '');
@@ -56,7 +56,7 @@ function detectDelimiter(text) {
     const avg = counts.reduce((a, b) => a + b, 0) / counts.length;
     const variance = counts.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / counts.length;
 
-    // Prioriza mais colunas e consistência
+    // Prioriza mais colunas e consistencia
     const score = Math.log(1 + avg) - variance;
 
     const better =
@@ -70,11 +70,11 @@ function detectDelimiter(text) {
   return best.delim;
 }
 
-/** Fallback: se o cabeçalho não abriu, força um delimitador que abre */
+/** Fallback: se o cabecalho nao abriu, força um delimitador que abre */
 function fallbackDelimiterByHeader(headerLine, chosen) {
   const tryDelims = [';', ',', '\t', '|'];
 
-  // se o escolhido já abre (>1 coluna), mantém
+  // se o escolhido ja abre (>1 coluna), mantem
   const colsChosen = splitCsvLine(headerLine, chosen);
   if (colsChosen.length > 1) return chosen;
 
@@ -89,7 +89,13 @@ function fallbackDelimiterByHeader(headerLine, chosen) {
 }
 
 function parseCsvToObjects(text, opts = {}) {
-  const { maxRows = 10000, maxCols = 200, forceDelimiter } = opts;
+  const {
+    maxRows = 10000,
+    maxCols = 200,
+    forceDelimiter,
+    offset = 0,
+    limit = 0,
+  } = opts;
   if (!text || !text.length) return [];
 
   const clean = stripBOM(text);
@@ -101,31 +107,45 @@ function parseCsvToObjects(text, opts = {}) {
   const lines = rawLines.slice(0, end);
   if (!lines.length) return [];
 
-  // cabeçalho bruto
+  // cabecalho bruto
   const headerLineRaw = lines[0];
 
   // escolhe delimitador (com fallback baseado no header)
   let delimiter = forceDelimiter || detectDelimiter(clean);
   delimiter = fallbackDelimiterByHeader(headerLineRaw, delimiter);
 
-  // cabeçalho final
+  // cabecalho final
   const headerRaw = splitCsvLine(headerLineRaw, delimiter);
   const header = headerRaw.map(sanitizeHeaderName);
 
-  if (!header.length) throw new Error('Cabeçalho CSV ausente.');
-  if (header.some(h => !h)) throw new Error('Cabeçalho CSV inválido: há coluna sem nome.');
-  if (new Set(header).size !== header.length) throw new Error('Cabeçalho CSV inválido: colunas duplicadas.');
+  if (!header.length) throw new Error('Cabecalho CSV ausente.');
+  if (header.some(h => !h)) throw new Error('Cabecalho CSV invalido: ha coluna sem nome.');
+  if (new Set(header).size !== header.length) throw new Error('Cabecalho CSV invalido: colunas duplicadas.');
   if (header.length > maxCols) throw new Error(`CSV com colunas demais (${header.length} > ${maxCols}).`);
 
   const out = [];
-  const dataLines = Math.min(lines.length - 1, maxRows);
+  const dataLines = lines.length - 1;
+  const safeOffset = Math.max(0, Number(offset || 0));
+  const safeLimit = Math.max(0, Number(limit || 0));
+  const takeLimit = safeLimit > 0 ? Math.min(safeLimit, maxRows) : maxRows;
+
+  let skipped = 0;
+  let produced = 0;
 
   for (let i = 1; i <= dataLines; i++) {
+    if ((skipped + produced) >= maxRows) break;
+    if (produced >= takeLimit) break;
+
     const line = lines[i] ?? '';
     const cols = splitCsvLine(line, delimiter);
 
-    // ignora linha totalmente vazia
+    // ignora linha totalmente vazia (nao conta para offset)
     if (cols.every(v => String(v ?? '').trim() === '')) continue;
+
+    if (skipped < safeOffset) {
+      skipped += 1;
+      continue;
+    }
 
     const obj = {};
     for (let c = 0; c < header.length; c++) {
@@ -134,27 +154,41 @@ function parseCsvToObjects(text, opts = {}) {
       obj[header[c]] = val;
     }
     out.push(obj);
+    produced += 1;
   }
 
-  // ⛑️ Segurança extra:
-  // Se por algum motivo sobrou linha com "chave única" contendo vários ';' e valor idem,
+  // Segurança extra:
+  // Se por algum motivo sobrou linha com "chave unica" contendo varios ';' e valor idem,
   // "explode" dinamicamente para colunas.
   if (out.length && Object.keys(out[0]).length === 1) {
     const onlyKey = Object.keys(out[0])[0] || '';
     const looksPacked = onlyKey.includes(';');
     if (looksPacked) {
-      // refaz mapeando com o mesmo delimitador decidido
       const fixed = [];
+      skipped = 0;
+      produced = 0;
       for (let i = 1; i <= dataLines; i++) {
+        if ((skipped + produced) >= maxRows) break;
+        if (produced >= takeLimit) break;
+
         const line = lines[i] ?? '';
         const vals = splitCsvLine(line, delimiter);
+
+        if (vals.every(v => String(v ?? '').trim() === '')) continue;
+
+        if (skipped < safeOffset) {
+          skipped += 1;
+          continue;
+        }
+
         const obj = {};
         for (let c = 0; c < header.length; c++) {
           obj[header[c]] = (vals[c] ?? '').trim();
         }
-        // descarta linhas 100% vazias
+        // descarta linhas 100% vazias (apos trim)
         if (!Object.values(obj).every(v => String(v ?? '').trim() === '')) {
           fixed.push(obj);
+          produced += 1;
         }
       }
       return fixed;

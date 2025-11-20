@@ -59,6 +59,21 @@ function buildHeadersFromRow(row, maxCols) {
   return headers;
 }
 
+function materializarRow(row, header, maxCols) {
+  const cellCount = Math.min(Number(row?.cellCount || header.length) || header.length, maxCols);
+  const record = {};
+  let hasValue = false;
+
+  for (let c = 1; c <= cellCount; c++) {
+    const key = header[c - 1] || `col_${c}`;
+    const val = toCell(row.getCell(c)?.value);
+    if (val !== '') hasValue = true;
+    record[key] = val;
+  }
+
+  return { record, hasValue };
+}
+
 /* ========================================================================
  * Leitura via STREAMING (preferencial)
  * - Objetivo: reduzir picos de memória (não materializa a planilha inteira).
@@ -110,16 +125,7 @@ async function carregarStream(contexto = {}) {
       }
 
       // Linhas de dados
-      const cellCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
-      const record = {};
-      let hasValue = false;
-
-      for (let c = 1; c <= cellCount; c++) {
-        const key = header[c - 1] || `col_${c}`;
-        const val = toCell(row.getCell(c)?.value);
-        if (val !== '') hasValue = true;
-        record[key] = val;
-      }
+      const { record, hasValue } = materializarRow(row, header, maxCols);
 
       if (hasValue) {
         outputRows.push(record);
@@ -178,16 +184,7 @@ async function carregarFallback(contexto = {}) {
 
   for (let r = headerRowIndex + 1; r <= dataLastIndex; r++) {
     const row = sheet.getRow(r);
-    const cellCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
-    const record = {};
-    let hasValue = false;
-
-    for (let c = 1; c <= cellCount; c++) {
-      const key = header[c - 1] || `col_${c}`;
-      const val = toCell(row.getCell(c)?.value);
-      if (val !== '') hasValue = true;
-      record[key] = val;
-    }
+    const { record, hasValue } = materializarRow(row, header, maxCols);
 
     if (hasValue) {
       outputRows.push(record);
@@ -275,16 +272,7 @@ async function carregarFaixa(contexto = {}) {
         }
 
         // Coletar dentro da janela
-        const cellCount = Math.min(Number(row.cellCount || header.length) || header.length, maxCols);
-        const record = {};
-        let hasValue = false;
-
-        for (let c = 1; c <= cellCount; c++) {
-          const key = header[c - 1] || `col_${c}`;
-          const val = toCell(row.getCell(c)?.value);
-          if (val !== '') hasValue = true;
-          record[key] = val;
-        }
+        const { record, hasValue } = materializarRow(row, header, maxCols);
 
         if (hasValue) {
           windowRows.push(record);

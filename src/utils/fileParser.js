@@ -1,6 +1,6 @@
 // src/utils/fileParser.js
-// Responsável por delegar a leitura de arquivos aos importadores específicos.
-// Otimizado para: segurança, detecção robusta de tipo e leitura por FAIXA (offset/limit) quando suportado.
+// Responsavel por delegar a leitura de arquivos aos importadores especificos.
+// Otimizado para: seguranca, deteccao robusta de tipo e leitura por FAIXA (offset/limit) quando suportado.
 
 const LIMITES = require('../importers/limites');
 const csvImporter = require('../importers/csvImporter');
@@ -14,11 +14,11 @@ const IMPORTADORES = {
 };
 
 /**
- * Heurística leve para detectar XLSX por assinatura ZIP "PK"
+ * Heuristica leve para detectar XLSX por assinatura ZIP "PK"
  * Evita depender apenas de content-type (muitos clients mandam errado).
  */
 function isZipSignatureXlsx(buffer = Buffer.alloc(0), filenameLower = '') {
-  // XLSX é um ZIP (50 4B = "PK"). Checamos os 2 primeiros bytes.
+  // XLSX e um ZIP (50 4B = "PK"). Checamos os 2 primeiros bytes.
   const hasZipMagic = buffer.length >= 2 && buffer[0] === 0x50 && buffer[1] === 0x4b;
   const endsWithXlsx = typeof filenameLower === 'string' && filenameLower.endsWith('.xlsx');
   return hasZipMagic && endsWithXlsx;
@@ -32,7 +32,7 @@ function detectKind({ contentType = '', filename = '', buffer } = {}) {
   const contentTypeLower = (contentType || '').toLowerCase();
   const filenameLower = (filename || '').toLowerCase();
 
-  // 1) Regras óbvias por extensão / mime comum
+  // 1) Regras obvias por extensao / mime comum
   if (contentTypeLower.includes('text/csv') || contentTypeLower.includes('application/csv') || filenameLower.endsWith('.csv')) {
     return 'csv';
   }
@@ -46,7 +46,7 @@ function detectKind({ contentType = '', filename = '', buffer } = {}) {
     return 'xml';
   }
 
-  // 2) Fallback: assinatura mínima para XLSX (ZIP + .xlsx)
+  // 2) Fallback: assinatura minima para XLSX (ZIP + .xlsx)
   if (isZipSignatureXlsx(buffer, filenameLower)) {
     return 'xlsx';
   }
@@ -55,7 +55,7 @@ function detectKind({ contentType = '', filename = '', buffer } = {}) {
 }
 
 /**
- * Validação de tamanho para mitigar uso excessivo de memória.
+ * Validacao de tamanho para mitigar uso excessivo de memoria.
  */
 function garantirTamanhoSeguro(buffer, maxBytes = LIMITES.MAX_BYTES) {
   if (!buffer || !buffer.length) return;
@@ -67,7 +67,7 @@ function garantirTamanhoSeguro(buffer, maxBytes = LIMITES.MAX_BYTES) {
 }
 
 /**
- * Leitura padrão: carrega TODO o arquivo e devolve array de objetos.
+ * Leitura padrao: carrega TODO o arquivo e devolve array de objetos.
  * Mantida por compatibilidade (preview, templates agregadores, CSV/XML, etc.).
  */
 async function parseFileToObjects({ buffer, contentType, filename, headers, limitarLinhas }) {
@@ -78,7 +78,7 @@ async function parseFileToObjects({ buffer, contentType, filename, headers, limi
   const contexto = { buffer, headers, limites: LIMITES, limitarLinhas };
 
   if (tipoDetectado === 'xls') {
-    const err = new Error('Arquivos .xls não são suportados por segurança. Exporte como .xlsx ou .csv.');
+    const err = new Error('Arquivos .xls nao sao suportados por seguranca. Exporte como .xlsx ou .csv.');
     err.statusCode = 400;
     throw err;
   }
@@ -96,23 +96,25 @@ async function parseFileToObjects({ buffer, contentType, filename, headers, limi
 }
 
 /**
- * NOVO — Leitura por faixa (offset/limit):
- * Para lotes grandes (ex.: 5.700 linhas), monta somente a janela que será enviada agora,
- * reduzindo CPU, memória e GC. Se o importador não suportar faixa, faz fallback: lê tudo e fatia.
+ * Leitura por faixa (offset/limit):
+ * Para lotes grandes, monta somente a janela que sera enviada agora,
+ * reduzindo CPU, memoria e GC. Se o importador nao suportar faixa, faz fallback: le tudo e fatia.
  *
- * Parâmetros:
- * - offset: índice inicial (0-based) das LINHAS DE DADOS (após o cabeçalho) a serem lidas.
- * - limit:  quantidade de linhas a ler; 0 ou ausente = até o fim.
+ * Parametros:
+ * - offset: indice inicial (0-based) das LINHAS DE DADOS (apos o cabecalho) a serem lidas.
+ * - limit:  quantidade de linhas a ler; 0 ou ausente = ate o fim (respeitando limites internos).
  */
 async function parseFileToObjectsRange({ buffer, contentType, filename, headers, offset = 0, limit = 0 }) {
   if (!buffer || !buffer.length) return [];
   garantirTamanhoSeguro(buffer);
 
+  const safeOffset = Math.max(0, Number(offset || 0));
+  const safeLimit = Math.max(0, Number(limit || 0));
   const tipoDetectado = detectKind({ contentType, filename, buffer });
-  const contextoFaixa = { buffer, headers, limites: LIMITES, offset, limit };
+  const contextoFaixa = { buffer, headers, limites: LIMITES, offset: safeOffset, limit: safeLimit };
 
   if (tipoDetectado === 'xls') {
-    const err = new Error('Arquivos .xls não são suportados por segurança. Exporte como .xlsx ou .csv.');
+    const err = new Error('Arquivos .xls nao sao suportados por seguranca. Exporte como .xlsx ou .csv.');
     err.statusCode = 400;
     throw err;
   }
@@ -122,10 +124,22 @@ async function parseFileToObjectsRange({ buffer, contentType, filename, headers,
     return xlsxImporter.carregarFaixa(contextoFaixa);
   }
 
-  // Fallback universal (CSV/XML/unknown): lê tudo e fatia
-  const todos = await parseFileToObjects({ buffer, contentType, filename, headers });
-  const safeOffset = Math.max(0, Number(offset || 0));
-  const safeLimit = Math.max(0, Number(limit || 0));
+  // CSV tambem pode fatiar sem materializar tudo
+  if (tipoDetectado === 'csv' && typeof csvImporter.carregarFaixa === 'function') {
+    return csvImporter.carregarFaixa(contextoFaixa);
+  }
+
+  // Fallback universal (CSV/XML/unknown): le tudo e fatia
+  const limitarLinhasFallback =
+    safeLimit > 0 ? Math.min(LIMITES.MAX_ROWS, safeOffset + safeLimit) : 0;
+
+  const todos = await parseFileToObjects({
+    buffer,
+    contentType,
+    filename,
+    headers,
+    limitarLinhas: limitarLinhasFallback,
+  });
   const endIndex = safeLimit > 0 ? safeOffset + safeLimit : todos.length;
   return todos.slice(safeOffset, endIndex);
 }
