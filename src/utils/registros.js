@@ -283,6 +283,24 @@ function limparRegistroPlano(registro) {
   return mesclarRelationships(base, normalizado, novosRelationships);
 }
 
+// Remove apenas campos vazios no nível raiz (envio direto):
+// - '' (string vazia ou só espaços) → remove
+// - null / undefined → remove
+// Mantém arrays, objetos, números, booleans.
+function removerCamposVaziosShallow(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    return obj;
+  }
+
+  const limpo = {};
+  for (const [chave, valor] of Object.entries(obj)) {
+    if (valor === null || valor === undefined) continue;
+    if (typeof valor === 'string' && valor.trim() === '') continue;
+    limpo[chave] = valor;
+  }
+  return limpo;
+}
+
 /**
  * Caminho SUPER LEVE: usado no ENVIO DIRETO.
  * - Nao normaliza tipos (mantem o que veio da planilha/constantes).
@@ -297,11 +315,51 @@ function limparRegistroDireto(registro) {
     return registro;
   }
 
-  const { base, relationships: novosRelationships } =
+  const { base, relationships: novos } =
     montarRelationshipsPorHeadersSemNormalizar(registro);
 
-  return mesclarRelationships(base, registro, novosRelationships);
+  // Sem relationships via *_rel[ID] → só limpa campos vazios do root
+  if (!novos.length) {
+    return removerCamposVaziosShallow(base);
+  }
+
+  const existentes = Array.isArray(base.__relationships__)
+    ? base.__relationships__
+    : [];
+
+  // Apenas novos relationships
+  if (!existentes.length) {
+    base.__relationships__ = novos;
+    return removerCamposVaziosShallow(base);
+  }
+
+  // Mescla relationships existentes + novos por Id
+  const byId = new Map();
+  const adicionar = (rel) => {
+    if (!rel || typeof rel !== 'object') return;
+    const idKey = String(rel.Id ?? '');
+    if (!byId.has(idKey)) {
+      byId.set(idKey, {
+        Id: rel.Id,
+        childrens: Array.isArray(rel.childrens) ? [...rel.childrens] : [],
+        records: Array.isArray(rel.records) ? [...rel.records] : [],
+      });
+    } else {
+      const acc = byId.get(idKey);
+      if (Array.isArray(rel.childrens)) acc.childrens.push(...rel.childrens);
+      if (Array.isArray(rel.records)) acc.records.push(...rel.records);
+    }
+  };
+
+  existentes.forEach(adicionar);
+  novos.forEach(adicionar);
+
+  base.__relationships__ = Array.from(byId.values());
+
+  // Limpa campos vazios do root (inclui cli_cidade_id, cli_estado_id, etc.)
+  return removerCamposVaziosShallow(base);
 }
+
 
 module.exports = {
   limparRegistroPlano,
