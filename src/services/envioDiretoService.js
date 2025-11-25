@@ -265,26 +265,62 @@ async function sendDuplicateAware({
     ? aggregated.results[0].body
     : JSON.stringify(aggregated.results[0]?.body || {});
 
-  // Falha de URL (ex.: x-endpoint-url invalido): parar cedo em vez de dividir em recursao
-  if (firstStatus === 599 && /invalid url/i.test(firstBodyStr || '')) {
-    return {
-      accepted: 0, inserted: 0, updated: 0, deleted: 0,
-      skippedDuplicates: 0,
-      errosBatchesCountDelta: errosBatchesCountDelta + 1,
-      batchesUsed: 1,
-      budgetLeft: null,
-      usedAdaptiveSplit: false,
-      fatalError: {
-        statusCode: 400,
-        body: JSON.stringify({ error: 'x-endpoint-url invalido ou inacessivel', detalhe: firstBodyStr }),
-        headers: {},
-      },
-    };
-  }
+// Falha de URL (ex.: x-endpoint-url invalido): parar cedo em vez de dividir em recursao
+if (firstStatus === 599 && /invalid url/i.test(firstBodyStr || '')) {
+  return {
+    accepted: 0, inserted: 0, updated: 0, deleted: 0,
+    skippedDuplicates: 0,
+    errosBatchesCountDelta: errosBatchesCountDelta + 1,
+    batchesUsed: 1,
+    budgetLeft: null,
+    usedAdaptiveSplit: false,
+    fatalError: {
+      statusCode: 400,
+      body: JSON.stringify({
+        error: 'x-endpoint-url invalido ou inacessivel',
+        detalhe: firstBodyStr,
+      }),
+      headers: {},
+    },
+  };
+}
 
-  // === Erro fatal de schema (coluna inexistente etc.) ===
+// === Erro fatal de autenticação/autorização (401/403) ===
+const noProgressAuth =
+  (inserted + updated + deleted + mergedCounts.alreadyExists) === 0;
+
+if (noProgressAuth && (firstStatus === 401 || firstStatus === 403)) {
   const first = aggregated.results[0];
-  const parsed = safeParseIfJson(firstBodyStr);
+  const payloadAuth = firstBodyStr && firstBodyStr.trim()
+    ? firstBodyStr
+    : JSON.stringify({
+        error:
+          'Falha de autenticação/autorização ao chamar a plataforma da Flowch',
+        statusCode: firstStatus,
+      });
+
+  return {
+    accepted: 0,
+    inserted: 0,
+    updated: 0,
+    deleted: 0,
+    skippedDuplicates: 0,
+    // se quiser contar na telemetria, pode usar "+ 1" aqui:
+    errosBatchesCountDelta,
+    batchesUsed: 1,
+    budgetLeft: null,
+    usedAdaptiveSplit: false,
+    fatalError: {
+      statusCode: firstStatus,
+      body: payloadAuth,
+      headers: first?.headers || {},
+    },
+  };
+}
+
+// === Erro fatal de schema (coluna inexistente etc.) ===
+const first = aggregated.results[0];
+const parsed = safeParseIfJson(firstBodyStr);
 
   const e0 = parsed?.errors?.[0]?.erro || {};
   const sqlCode  = String(e0.code || '').toUpperCase();
