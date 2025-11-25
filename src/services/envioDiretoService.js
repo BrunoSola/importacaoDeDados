@@ -265,66 +265,65 @@ async function sendDuplicateAware({
     ? aggregated.results[0].body
     : JSON.stringify(aggregated.results[0]?.body || {});
 
-// Falha de URL (ex.: x-endpoint-url invalido): parar cedo em vez de dividir em recursao
-if (firstStatus === 599 && /invalid url/i.test(firstBodyStr || '')) {
-  return {
-    accepted: 0, inserted: 0, updated: 0, deleted: 0,
-    skippedDuplicates: 0,
-    errosBatchesCountDelta: errosBatchesCountDelta + 1,
-    batchesUsed: 1,
-    budgetLeft: null,
-    usedAdaptiveSplit: false,
-    fatalError: {
-      statusCode: 400,
-      body: JSON.stringify({
-        error: 'x-endpoint-url invalido ou inacessivel',
-        detalhe: firstBodyStr,
-      }),
-      headers: {},
-    },
-  };
-}
+  // Falha de URL (ex.: x-endpoint-url invalido): parar cedo em vez de dividir em recursao
+  if (firstStatus === 599 && /invalid url/i.test(firstBodyStr || '')) {
+    return {
+      accepted: 0, inserted: 0, updated: 0, deleted: 0,
+      skippedDuplicates: 0,
+      errosBatchesCountDelta: errosBatchesCountDelta + 1,
+      batchesUsed: 1,
+      budgetLeft: null,
+      usedAdaptiveSplit: false,
+      fatalError: {
+        statusCode: 400,
+        body: JSON.stringify({
+          error: 'x-endpoint-url invalido ou inacessivel',
+          detalhe: firstBodyStr,
+        }),
+        headers: {},
+      },
+    };
+  }
 
-// === Erro fatal de autenticação/autorização (401/403) ===
-const noProgressAuth =
-  (inserted + updated + deleted + mergedCounts.alreadyExists) === 0;
-
-if (noProgressAuth && (firstStatus === 401 || firstStatus === 403)) {
   const first = aggregated.results[0];
-  const payloadAuth = firstBodyStr && firstBodyStr.trim()
-    ? firstBodyStr
-    : JSON.stringify({
-        error:
-          'Falha de autenticação/autorização ao chamar a plataforma da Flowch',
+  const parsed = safeParseIfJson(firstBodyStr);
+
+  // === Erro fatal de autenticação/autorização (401/403) ===
+  const noProgressAuth =
+    (inserted + updated + deleted + mergedCounts.alreadyExists) === 0;
+
+  if (noProgressAuth && (firstStatus === 401 || firstStatus === 403)) {
+    const payloadAuth =
+      firstBodyStr && firstBodyStr.trim()
+        ? firstBodyStr
+        : JSON.stringify({
+            error:
+              'Falha de autenticação/autorização ao chamar a plataforma da Flowch',
+            statusCode: firstStatus,
+          });
+
+    return {
+      accepted: 0,
+      inserted: 0,
+      updated: 0,
+      deleted: 0,
+      skippedDuplicates: 0,
+      errosBatchesCountDelta,
+      batchesUsed: 1,
+      budgetLeft: null,
+      usedAdaptiveSplit: false,
+      fatalError: {
         statusCode: firstStatus,
-      });
+        body: payloadAuth,
+        headers: first?.headers || {},
+      },
+    };
+  }
 
-  return {
-    accepted: 0,
-    inserted: 0,
-    updated: 0,
-    deleted: 0,
-    skippedDuplicates: 0,
-    // se quiser contar na telemetria, pode usar "+ 1" aqui:
-    errosBatchesCountDelta,
-    batchesUsed: 1,
-    budgetLeft: null,
-    usedAdaptiveSplit: false,
-    fatalError: {
-      statusCode: firstStatus,
-      body: payloadAuth,
-      headers: first?.headers || {},
-    },
-  };
-}
-
-// === Erro fatal de schema (coluna inexistente etc.) ===
-const first = aggregated.results[0];
-const parsed = safeParseIfJson(firstBodyStr);
-
+  // === Análise de erros 400 (schema/validação) ===
   const e0 = parsed?.errors?.[0]?.erro || {};
-  const sqlCode  = String(e0.code || '').toUpperCase();
-  const sqlMsg   = String(e0.sqlMessage || '').toLowerCase();
+  const sqlCode = String(e0.code || '').toUpperCase();
+  const sqlMsg = String(e0.sqlMessage || '').toLowerCase();
   const sqlState = String(e0.sqlState || '');
 
   // Regras fatais: ER_BAD_FIELD_ERROR / "unknown column" / 42S22 (MySQL)
@@ -333,14 +332,47 @@ const parsed = safeParseIfJson(firstBodyStr);
     sqlState === '42S22' ||
     sqlMsg.includes('unknown column');
 
-  const totalChanges = mergedCounts.inserted + mergedCounts.updated + mergedCounts.deleted;
-  const houveProgresso = (totalChanges > 0) || (mergedCounts.alreadyExists > 0);
+  const totalChanges =
+    mergedCounts.inserted + mergedCounts.updated + mergedCounts.deleted;
+  const houveProgresso =
+    (totalChanges > 0) || (mergedCounts.alreadyExists > 0);
 
+  // Erro fatal de schema (coluna inexistente etc.)
   if (!houveProgresso && isSchemaError) {
     return {
-      accepted: 0, inserted: 0, updated: 0, deleted: 0,
+      accepted: 0,
+      inserted: 0,
+      updated: 0,
+      deleted: 0,
       skippedDuplicates: 0,
       errosBatchesCountDelta,
+      batchesUsed: 1,
+      budgetLeft: null,
+      usedAdaptiveSplit: false,
+      fatalError: {
+        statusCode: 400,
+        body: firstBodyStr,
+        headers: first?.headers || {},
+      },
+    };
+  }
+
+  // Erro fatal de validação por registro (400 com errors[], mas não é schema)
+  if (
+    !houveProgresso &&
+    firstStatus === 400 &&
+    Array.isArray(parsed?.errors) &&
+    parsed.errors.length > 0
+  ) {
+    dbg('decision', { kind: 'validation-error', status: firstStatus });
+
+    return {
+      accepted: 0,
+      inserted: 0,
+      updated: 0,
+      deleted: 0,
+      skippedDuplicates: 0,
+      errosBatchesCountDelta: errosBatchesCountDelta + 1,
       batchesUsed: 1,
       budgetLeft: null,
       usedAdaptiveSplit: false,
